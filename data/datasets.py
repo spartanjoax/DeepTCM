@@ -55,7 +55,6 @@ class NASA_Dataset(Dataset):
                 statistics of each signal and generating plots for visualization. Defaults to False.
             sliding_window_size (int): Size of the sliding window (for data augmentation). Defaults to 250.
             sliding_window_stride (int): Stride of the sliding window. Defaults to 25.
-            scalogram_cwt (str): The wavelet to use to generate scalograms, e.g., 'morse'. Defaults to None. 
 
         Attributes:
             self.data (torch.Tensor): Tensor containing the processed input signals.
@@ -90,7 +89,7 @@ class NASA_Dataset(Dataset):
 
         if not os.path.exists(data_file_name):
             print('================== NASA dataset files do not exist\nProcessing and saving splits')
-            self._process_dataset(sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride, data_file_name=data_file_name)
+            self._process_dataset(sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride, data_file_name=data_file_name,apply_averaging=True)
         else:
             print('================== NASA dataset files exist\nLoading pre-saved splits')
 
@@ -111,62 +110,103 @@ class NASA_Dataset(Dataset):
         #    x, x_process_params, y = xte, xte_proc, yte
         
         if split_type == 'runs':
-            # Extract unique runs as groups (case-run pairs)
-            unique_runs = np.unique(x_process_params[:, :2], axis=0)
-        
-            # Split runs (not windows)
-            train_runs, test_runs = train_test_split(
-                unique_runs,
-                test_size=split_ratios[2],
-                random_state=self.seed
-            )
-                    
-            if split_ratios[1] != 0:
-                train_runs, val_runs = train_test_split(
-                    train_runs,
-                    test_size=split_ratios[1] / (split_ratios[0] + split_ratios[1]),
-                    random_state=self.seed
-                )
-            else:
-                val_runs = np.empty((0, 2))  # no validation
-            print("Train runs", train_runs.T)
-            print("Val runs", val_runs.T)
-            print("Test runs", test_runs.T)
-        
+            # Split runs per-case, then join. Ensure at least 1 run per case goes to the test set
+            cases = np.unique(x_process_params[:, 0])
+            train_pairs = []
+            val_pairs = []
+            test_pairs = []
+
+            test_ratio = split_ratios[2]
+            val_ratio = split_ratios[1]
+            train_ratio = split_ratios[0]
+
+            for c in np.sort(cases):
+                # get unique runs for this case
+                runs = np.unique(x_process_params[x_process_params[:, 0] == c, 1]).astype(int)
+                n = len(runs)
+                if n == 0:
+                    continue
+                # deterministic shuffle per-case
+                rng = np.random.RandomState(self.seed + int(c))
+                perm = rng.permutation(n)
+                runs_shuffled = runs[perm]
+
+                # select test runs, ensure at least 1 run per case for test when test_ratio>0
+                if test_ratio > 0:
+                    test_count = max(1, int(np.round(test_ratio * n)))
+                    # limit test_count to at most n (if it becomes > n)
+                    test_count = min(test_count, n)
+                else:
+                    test_count = 0
+                test_sel = runs_shuffled[:test_count]
+
+                # remaining runs to be split into train/val
+                remaining = runs_shuffled[test_count:]
+                if val_ratio > 0 and len(remaining) > 1:
+                    rel_val = val_ratio / (train_ratio + val_ratio)
+                    tr, vl = train_test_split(
+                        remaining, test_size=rel_val, random_state=self.seed
+                    )
+                else:
+                    # not enough runs to create a per-case validation split -> assign all to train
+                    tr = remaining
+                    vl = np.array([], dtype=int)
+
+                # collect (case, run) pairs
+                for r in tr:
+                    train_pairs.append([int(c), int(r)])
+                for r in vl:
+                    val_pairs.append([int(c), int(r)])
+                for r in test_sel:
+                    test_pairs.append([int(c), int(r)])
+
+            # convert to arrays (may be empty)
+            self.train_runs = np.array(train_pairs, dtype=x_process_params[:, :2].dtype).reshape((-1, 2)) if len(train_pairs) > 0 else np.empty((0, 2))
+            self.val_runs = np.array(val_pairs, dtype=x_process_params[:, :2].dtype).reshape((-1, 2)) if len(val_pairs) > 0 else np.empty((0, 2))
+            self.test_runs = np.array(test_pairs, dtype=x_process_params[:, :2].dtype).reshape((-1, 2)) if len(test_pairs) > 0 else np.empty((0, 2))
+
             # Assign based on split
             if split == 'train':
-                selected_runs = train_runs
+                selected_runs = self.train_runs
             elif split == 'val':
-                selected_runs = val_runs
+                selected_runs = self.val_runs
             else:
-                selected_runs = test_runs
+                selected_runs = self.test_runs
         
             # Create boolean mask selecting all windows from selected runs
-            mask = np.any(
-                (x_process_params[:, :2, None] == selected_runs.T).all(axis=1), axis=1
-            )
-        
+            if selected_runs.size == 0:
+                mask = np.zeros(len(x_process_params), dtype=bool)
+            else:
+                mask = np.any((x_process_params[:, :2, None] == selected_runs.T).all(axis=1), axis=1)
+
             x, x_process_params, y = x[mask], x_process_params[mask], y[mask]
         
         elif split_type == 'cases':
         
-            train_cases = [1, 2, 3, 4, 5, 6, 7, 8]
-            val_cases   = [9, 10, 13, 14]
-            test_cases  = [11, 12, 15, 16]
+            self.train_runs = [1, 2, 3, 4, 5, 6, 7, 8, 10, 14, 9, 13]
+            self.val_runs   = [12, 16]
+            self.test_runs  = [11, 15]
         
             if split == 'train':
-                mask = np.isin(x_process_params[:, 0], train_cases)
+                mask = np.isin(x_process_params[:, 0], self.train_runs)
             elif split == 'val':
-                mask = np.isin(x_process_params[:, 0], val_cases)
+                mask = np.isin(x_process_params[:, 0], self.val_runs)
             else:
-                mask = np.isin(x_process_params[:, 0], test_cases)
+                mask = np.isin(x_process_params[:, 0], self.test_runs)
         
             x, x_process_params, y = x[mask], x_process_params[mask], y[mask]
         x_process_params = x_process_params[:, 2:]
         print(f'================== Data splitted for {split} split: {len(x)/total_data*100}%')
         print(f'Shapes -> X: {x.shape} - X process params: {x_process_params.shape} - Y: {y.shape}')
         
+        if debug_plots:
+            plot_signals(x, NASA_Dataset.signal_list, signal_chanel=2)
+
         x, x_process_params, y = augment_signal(x, x_process_params, y, window_size=sliding_window_size, stride=sliding_window_stride)
+        
+        if debug_plots:
+            plot_signals(x, NASA_Dataset.signal_list, signal_chanel=2)
+                         
         print(f'================== Data augmented')
         print(f'Shapes -> X: {x.shape} - X process params: {x_process_params.shape} - Y: {y.shape}')
 
@@ -309,13 +349,12 @@ class NASA_Dataset(Dataset):
         #print('Labels shape after augmentation:', y.shape)
         #print('================== Data augmented')
 
-        #if self.debug_plots:
-        #    plot_signals(x, NASA_Dataset.signal_list, signal_chanel=2)
+        if self.debug_plots:
+            plot_signals(x, NASA_Dataset.signal_list, signal_chanel=2)
         
         dump([x, x_process_params, y], data_file_name)
 
-    def remove_signals(self, data):
-        idx = []
+    def get_signal_list(self):
         signals = NASA_Dataset.signal_list.copy()
         if self.signal_group == 'DC':
             signals = ['smcDC']
@@ -339,6 +378,11 @@ class NASA_Dataset(Dataset):
             signals = ['smcAC', 'smcDC']
         elif self.signal_group == 'all':
             signals = ['smcAC', 'smcDC', 'vib_table', 'vib_spindle', 'AE_table', 'AE_spindle']
+        return signals
+
+    def remove_signals(self, data):
+        idx = []
+        signals = self.get_signal_list()
         idx = [index for index, element in enumerate(NASA_Dataset.signal_list) if element not in signals]
         x = np.delete(data, idx, axis=2)
         return x
@@ -470,18 +514,46 @@ class MU_TCM_Dataset(Dataset):
         xtr, xte, xtr_proc, xte_proc, ytr, yte = train_test_split(x, x_process_params, y, test_size=split_ratios[2], random_state=self.seed)
         
         total_data = len(x)
-        if split_type == 'random':
-            if split == 'train':
-                if split_ratios[1] != 0:
-                    x, _, x_process_params, _, y, _ = train_test_split(xtr, xtr_proc, ytr, test_size=(split_ratios[1] / (split_ratios[0]+split_ratios[2])), random_state=self.seed)
-                else: # When there is no validation, split, return the whole train set
-                    x, x_process_params, y = xtr, xtr_proc, ytr
-            elif split == 'val':
-                _, x, _, x_process_params, _, y = train_test_split(xtr, xtr_proc, ytr, test_size=(split_ratios[1] / (split_ratios[0]+split_ratios[2])), random_state=self.seed)
-            else:
-                x, x_process_params, y = xte, xte_proc, yte
+        
+        # Extract unique runs as groups (case-run pairs)
+        unique_runs = np.unique(x_process_params, axis=0)
+    
+        # Split runs (not windows)
+        self.train_runs, self.test_runs = train_test_split(
+            unique_runs,
+            test_size=split_ratios[2],
+            random_state=self.seed
+        )
+                
+        if split_ratios[1] != 0:
+            self.train_runs, self.val_runs = train_test_split(
+                self.train_runs,
+                test_size=split_ratios[1] / (split_ratios[0] + split_ratios[1]),
+                random_state=self.seed
+            )
+        else:
+            self.val_runs = np.empty((0, 2))  # no validation
+    
+        # Assign based on split
+        if split == 'train':
+            selected_runs = self.train_runs
+        elif split == 'val':
+            selected_runs = self.val_runs
+        else:
+            selected_runs = self.test_runs
+    
+        # Create boolean mask selecting all windows from selected runs
+        mask = np.any(
+            (x_process_params[:, :2, None] == selected_runs.T).all(axis=1), axis=1
+        )
+    
+        x, x_process_params, y = x[mask], x_process_params[mask], y[mask]
 
         print(f'================== Data splitted for {split} split: {len(x)/total_data*100}%')
+        print(f'Shapes -> X: {x.shape} - X process params: {x_process_params.shape} - Y: {y.shape}')
+        
+        x, x_process_params, y = augment_signal(x, x_process_params, y, window_size=sliding_window_size, stride=sliding_window_stride)
+        print(f'================== Data augmented')
         print(f'Shapes -> X: {x.shape} - X process params: {x_process_params.shape} - Y: {y.shape}')
 
         if use_synth:
@@ -656,26 +728,25 @@ class MU_TCM_Dataset(Dataset):
         if self.debug_plots:
             plot_signals(x, MU_TCM_Dataset.signal_list)
 
-        print('================== Augmenting signals')
-        x, x_proc_params, y = augment_signal(x, x_proc_params, y, window_size=sliding_window_size, stride=sliding_window_stride)
+        # print('================== Augmenting signals')
+        # x, x_proc_params, y = augment_signal(x, x_proc_params, y, window_size=sliding_window_size, stride=sliding_window_stride)
 
         if self.debug_plots:
             plot_signals(x, MU_TCM_Dataset.signal_list)
 
         x = np.transpose(x, (0, 2, 1))
-        print('Signals shape after augmentation:', x.shape)
-        print('Parameters shape after augmentation:', x_proc_params.shape)
-        print('Labels shape after augmentation:', y.shape)
-        print('================== Data augmented')
+        # print('Signals shape after augmentation:', x.shape)
+        # print('Parameters shape after augmentation:', x_proc_params.shape)
+        # print('Labels shape after augmentation:', y.shape)
+        # print('================== Data augmented')
 
         if self.debug_plots:
             plot_signals(x, MU_TCM_Dataset.signal_list, signal_chanel=2)
 
         dump([x, x_proc_params, y], data_file_name)
 
-    def remove_signals(self, data):
-        idx = []
-        signals = MU_TCM_Dataset.signal_list.copy()
+    def get_signal_list(self):
+        signals = NASA_Dataset.signal_list.copy()
         if self.signal_group in ('DC','AC'):
             signals = ['CV3_S']
         elif self.signal_group in ('DC_AE','AC_AE'):
@@ -688,6 +759,11 @@ class MU_TCM_Dataset(Dataset):
             signals = ['Ay','AE_F']
         elif self.signal_group in ('internals'):
             signals = ['CV3_S', 'CV3_X', 'CV3_Y', 'CV3_Z', 'FREAL', 'SREAL', 'TV2_S', 'TV2_X', 'TV2_Y', 'TV2_Z', 'TV50', 'TV51']
+        return signals
+
+    def remove_signals(self, data):
+        idx = []
+        signals = self.get_signal_list()
         idx = [index for index, element in enumerate(MU_TCM_Dataset.signal_list) if element not in signals]
         x = np.delete(data, idx, axis=2)
         return x

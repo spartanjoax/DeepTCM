@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 
-from sklearn.metrics import r2_score, mean_absolute_error, mean_absolute_percentage_error
+from sklearn.metrics import r2_score, root_mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
 from scipy.signal import resample
 from torch import sqrt, mean
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 from fnmatch import fnmatch
@@ -17,14 +16,13 @@ from tslearn.barycenters import softdtw_barycenter
 from tslearn.metrics import gamma_soft_dtw
 
 import pywt
+from stockwell import st
 
 import warnings
 warnings.filterwarnings("ignore")
 
-SCALES = np.arange(1, 201)  # scales 1–200 as per the paper
-
 def get_scores(y_true, y_pred):
-    rmse = root_mse(y_true, y_pred)
+    rmse = root_mean_squared_error(y_true, y_pred)
     r2 = r2_score(y_true, y_pred)
     mae = mean_absolute_error(y_true, y_pred)
     mape = mean_absolute_percentage_error(y_true, y_pred)
@@ -72,6 +70,7 @@ def downsample(signal, to_len):
     return down_signal
 
 def plot_signals(x, signal_list, signal_chanel=1):
+    print(f'Plotting x with shape: {x[0].shape}')
     # Determine the number of subplots based on the second dimension, at least 2 rows.
     num_subplots = max(min(len(signal_list), 30), 4)
     print(f'Subplots: {num_subplots} - Rows: {(num_subplots + 2) // 3}')
@@ -86,6 +85,9 @@ def plot_signals(x, signal_list, signal_chanel=1):
             axes[row, col].plot(x[0][i, :])
         elif signal_chanel == 2:
             axes[row, col].plot(x[0][:, i])
+        elif signal_chanel == 3:
+            print(F'channel {i} mean', x[0][:, :, i].mean())
+            axes[row, col].imshow(x[0][:, :, i])
         axes[row, col].set_title(f"Signal {signal_list[i]}")
         if len(signal_list) - 1 == i:
             break
@@ -93,7 +95,7 @@ def plot_signals(x, signal_list, signal_chanel=1):
     # Adjust layout (optional)
     fig.suptitle("Sample 1: Individual Signal Plots", fontsize=12)
     plt.tight_layout()
-
+    plt.savefig(f"X_plots.png")
     plt.show()
 
 def plot_signals_dict(x, signal_list):
@@ -223,17 +225,30 @@ def augment_dataset_softdtw(x, x_proc, y, num_synthetic_ts, max_neighbors=5):
     # return the synthetic set     
     return np.array(synthetic_x), np.array(synthetic_x_proc), np.array(synthetic_y)
 
-def generate_cwt(signal_1d, scales=SCALES, wavelet='cmor', scalogram_size=(224, 224)):
+def convert_to_cwt(x, n_scales=200, wavelet='morl', description='CWT generation'):
     """
-    data shape: (T, C) - T = Time, C = Channel
-    returns: CWT_tensor shape: (N, H, W, C) - H  = Height, W = Width
-    """    
-    coef, _ = pywt.cwt(signal_1d, scales, wavelet)
-    # Normalise scalogram
-    scalogram = np.abs(coef)
-    scalogram = scalogram / (np.max(scalogram) + 1e-12)
+    data shape: (N, W, C) - N = Number of samples, W = Width of the sample (time), C = Channel
+    returns: CWT numpy array with shape: (N, S, W, C) - S = Scales (height), W = Width
+    """   
+    scales = np.arange(1, n_scales+1)#np.logspace(np.log10(1), np.log10(n_scales), n_scales) # 1 … n_scales  (same for both)
+    cwt = np.empty((x.shape[0], n_scales, x.shape[1], x.shape[2]), dtype=x.dtype)
+    for n in tqdm(range(x.shape[0]), desc=description):
+        for c in range(x.shape[2]):
+            coef, _ = pywt.cwt(x[n, :, c], scales, wavelet)
+            cwt[n, :, :, c] = np.abs(coef)
+    return cwt
     
-    return scalogram
+def convert_to_stransform(x, lo=0, hi=125, gamma=1, description='S-transform generation'):
+    """
+    data shape: (N, W, C) - N = Number of samples, W = Width of the sample (time), C = Channel
+    returns: S-transform numpy array with shape: (N, H, W, C) - H = Height (frequency)
+    """
+    cwt = np.empty((x.shape[0], hi+1, x.shape[1], x.shape[2]), dtype=x.dtype)
+    for n in tqdm(range(x.shape[0]), desc=description):
+        for c in range(x.shape[2]):
+            stransf = st.st(x[n, :, c], hi=hi, lo=lo, gamma=gamma)
+            cwt[n, :, :, c] = np.abs(stransf)
+    return cwt
     
 __all__ = [
     'get_scores',
@@ -247,5 +262,6 @@ __all__ = [
     'compute_mean_std',
     'compute_min_max',
     'augment_dataset_softdtw',
-    'generate_cwt',
+    'convert_to_cwt',
+    'convert_to_stransform'
 ]
