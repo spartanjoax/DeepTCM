@@ -235,7 +235,13 @@ def convert_to_cwt(x, n_scales=200, wavelet='morl', description='CWT generation'
     for n in tqdm(range(x.shape[0]), desc=description):
         for c in range(x.shape[2]):
             coef, _ = pywt.cwt(x[n, :, c], scales, wavelet)
-            cwt[n, :, :, c] = np.abs(coef)
+            # Step 1: Compute magnitude
+            magnitude = np.abs(coef)
+            # Step 2: Scale normalization (1/sqrt(scale))
+            scale_norm = magnitude / np.sqrt(scales[:, np.newaxis])
+            # Step 3: Log transform
+            log_transformed = np.log(scale_norm + 1e-6)
+            cwt[n, :, :, c] = log_transformed
     return cwt
     
 def convert_to_stransform(x, lo=0, hi=125, gamma=1, description='S-transform generation'):

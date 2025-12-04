@@ -20,16 +20,12 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_absolute_percent
 from joblib import dump
 from pathlib import Path
 
-from keras.models import Model, load_model
+from keras.models import load_model
 from keras.utils import plot_model
-from keras import Sequential
-from keras.layers import Input, LSTM, Dense, Conv2D, Conv1D, AveragePooling2D, AveragePooling1D, Flatten, Bidirectional, GRU, concatenate, Dropout, BatchNormalization, Activation, Add, Multiply, GlobalAveragePooling1D, GlobalAveragePooling2D, Lambda, Resizing, LayerNormalization
-from keras.optimizers import Adam, SGD
-from keras.regularizers import l2
 from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from keras.losses import Huber
 from keras import saving
-from keras.applications import Xception
+
+from models import create_xception, create_resnet, create_lstm, create_bigru, create_cnn, create_ensemble, root_mse
 
 # Clear all previously registered custom objects
 saving.get_custom_objects().clear()
@@ -44,6 +40,11 @@ import time
 
 import logging
 import datetime
+
+import warnings
+def warn(*args, **kwargs):
+    pass
+warnings.warn = warn
 
 sns.set_context("paper")
 sns.set(font_scale = 1)
@@ -65,19 +66,12 @@ data_transform_cwt = [
     None
     #'cwt'
 ]
-import warnings
-def warn(*args, **kwargs):
-    pass
-warnings.warn = warn
 
 class NumpyFloatValuesEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.float32):
             return float(obj)
         return json.JSONEncoder.default(self, obj)
-
-def root_mse(y_test, y_pred):
-    return K.sqrt(K.mean(K.square(y_pred - y_test)))  #mean_squared_error(y_test, y_pred,squared=False)
 
 def get_scores(y_test, y_pred):
     rmse = float(tf.squeeze(root_mse(y_test, y_pred)).numpy())
@@ -86,14 +80,18 @@ def get_scores(y_test, y_pred):
     mape = mean_absolute_percentage_error(y_test, y_pred)
     return rmse, r2, mae, mape
 
-def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, results, model_results, folder=None):
+def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, results, model_results, folder=None, y_min=0, y_max=1):
     # Evaluate the model on the test set
     start_time = time.time()
     ypred = model.predict(x_test)
     total_time = time.time() - start_time
     model_results['eval_time'] = total_time
     
-    rmse, r2, mae, mape = get_scores(y_test, ypred)
+    # Inverse transform predictions and targets
+    ypred_orig = ypred * (y_max - y_min) + y_min
+    y_test_orig = y_test * (y_max - y_min) + y_min
+    
+    rmse, r2, mae, mape = get_scores(y_test_orig, ypred_orig)
     print(f'RMSE: {rmse:.5f}\nR2: {r2:.5f}\nMAE: {mae:.5f}\nMAPE: {mape:.5f}')
     
     file_name = f'{folder + "/" if folder is not None else ""}DL_{model_name}_{run_name}_{rmse:.4f}.h5'
@@ -105,7 +103,7 @@ def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, resu
 
     model.save(file_name)
 
-    results_df = pd.DataFrame({'Ground truth' : np.squeeze(y_test), 'Prediction' : np.squeeze(ypred)},columns=['Ground truth', 'Prediction']).sort_values(by=['Ground truth'], ignore_index=True)
+    results_df = pd.DataFrame({'Ground truth' : np.squeeze(y_test_orig), 'Prediction' : np.squeeze(ypred_orig)},columns=['Ground truth', 'Prediction']).sort_values(by=['Ground truth'], ignore_index=True)
 
     plt.plot(results_df['Prediction'], label='Prediction')
     plt.plot(results_df['Ground truth'], label='Ground truth')
@@ -113,331 +111,84 @@ def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, resu
     plt.savefig(f"{folder + '/' if folder is not None else ''}/DL_{model_name}_{run_name}_test_pred.png")
     plt.clf()
 
-def resnet_block(x, filters, kernel_size, name='', line=0, attention=False, downsample=False, signal_qty=1, is_2d=False):
-    shortcut = x
-    x = conv_bn_relu(x, filters, kernel_size, padding='same', name=name, line=line, signal_qty=signal_qty, is_2d=is_2d)
-    x = conv_bn_relu(x, filters, kernel_size, padding='same', name=name, line=str(line)+'_1', signal_qty=signal_qty, is_2d=is_2d)
-    if downsample:
-        if not is_2d:
-            shortcut = Conv1D(kernel_size=1, strides=1, filters=filters, padding="same", name=name+'_res_'+str(line)+'_down')(shortcut)
-        #elif signal_qty > 1 and is_2d:
-        #    shortcut = Conv3D(kernel_size=1, strides=1, filters=filters, padding="same", name=name+'_res_'+str(line)+'_down')(shortcut)
-        else:
-            shortcut = Conv2D(kernel_size=1, strides=2, filters=filters, padding="same", name=name+'_res_'+str(line)+'_down')(shortcut)
-    if attention:
-        x = Multiply(name=name+f'_mult_{line}')([x, shortcut])
-    x = Add(name=name+f'_add_{line}')([x, shortcut])
-    return x
+def train_model(model_name, create_fn, train_data, val_data, test_data, 
+                folder, run, cwt_transform, epochs, resume_training, 
+                logger, index, results, cwt_times, model_params=None, fit_params=None, 
+                patience=50, plot_graph=False, y_min=0, y_max=1):
+    
+    xtr, ytr = train_data
+    xval, yval = val_data
+    xte, yte = test_data
+    
+    cwt_time_tr, cwt_time_te = cwt_times
 
-def feature_denoising(x, filters, kernel_size, dropout, signal_qty=1, name='', padding='valid', is_2d=False):
-    if not is_2d:
-        x = Conv1D(filters=filters*signal_qty, kernel_size=5, groups=signal_qty, name=name+'_Denoise')(x)
+    logger.info(f'\n================== Training {model_name} with {cwt_transform} as transform')
+    
+    es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=patience, min_delta=es_min_delta, restore_best_weights=True)
+    mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
+    clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
+    
+    start_time = time.time()
+    model_results = {
+        'model_name' : model_name,
+        'scalogram' : str(cwt_transform),
+        'cwt_time_tr': cwt_time_tr,
+        'cwt_time_te': cwt_time_te,
+    }
+
+    print(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
+    matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
+    
+    model = None
+    if len(matches) > 0 and resume_training:
+        logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
+        model = load_model(matches[0], compile=False)
+        with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
+            model_results = json.load(fp)
+        total_time = model_results['time']
+        logger.info(f'================== Model {model_name} for run {run} loaded')
     else:
-        x = Conv2D(filters=filters*signal_qty, kernel_size=(5, 1), groups=signal_qty, name=name+'_Denoise')(x)
-    x = BatchNormalization(name=name+'_Denoise_BN')(x)
-    x = Activation('relu', name=name+'_Denoise_ReLU')(x) 
-    x = Dropout(dropout, name=name+'_Denoise_drop')(x)
-    return x
+        logger.info(f'================== Training {model_name} for run {run}')
+        
+        if model_params is None:
+            model_params = {}
+        model = create_fn(**model_params)
+        
+        if plot_graph:
+             plot_model(model, show_shapes=True, to_file=f'{folder}/DL_{model_name}_graph_{run}_{cwt_transform}.png')
 
-def create_xception(learning_r=1e-3,
-               decay=1e-5,
-               dropout=0.2,
-               x_shape=[1,1],
-               name='xception',
-               scalogram_cwt=None):
-    is_2d = scalogram_cwt is not None
-    
-    signal_input_resnet = Input(x_shape[1:], name=name+'_signal_input')
-
-    height = 224#x_shape[1] if is_2d else 71
-    width = x_shape[-2]
-    
-    resnet = Xception(include_top=False, pooling='avg', input_shape=(height, width, 3))
-    
-    if not is_2d:
-        x = Lambda(lambda x: tf.expand_dims(x, axis=1))(signal_input_resnet)  # Add height dimension
-
-    x = Conv2D(filters=3, kernel_size=1, padding='same', strides=1, name=name+'_ConvResize')(x if not is_2d else signal_input_resnet)
-    print("Change to 3 channels:",x.shape)
-    
-    x = Resizing(224, width)(x)
-    print("Resize:",x.shape)
-    
-    x = resnet(x)
-    
-    x = Dense(512, activation='relu', name=name+'_dense1')(x)
-    x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(512, activation='relu', name=name+'_dense2')(x)
-    x = Dropout(dropout, name=name+'_drop_final_2')(x)
-    x = Dense(1, activation='linear', name=name+'_output')(x)
-    
-    model_resnet = Model(inputs=signal_input_resnet, outputs=x, name=name)    
-    
-    model_resnet.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
-    
-    return model_resnet
-
-def create_resnet(learning_r=1e-3,
-               decay=1e-5,
-               dropout=0.2,
-               x_shape=[1,1],
-               name='resnet',
-               filters=[32, 64, 64, 64, 128, 128, 128, 256],
-               kernel_size=[3, 3, 3, 3, 3, 3, 3, 3],
-               pooling=[2, 2, 2, 2, 2, 2, 2, 2],
-               apply_dropout=[True, False, False, False, False, False, False, False],
-               apply_pooling=[True, False, False, True, False, False, True, False],
-               #apply_pooling=[False, True, False, True, False, True, False],
-               is_resnet=[False, False, True, True, False, True, True, False],
-               regress=True, 
-               attention=False,
-               scalogram_cwt=None):
-    is_2d = scalogram_cwt is not None
-    signal_qty = x_shape[-1]
-    padding = 'valid' if x_shape[-1] == 1 else 'same'
-    
-    signal_input_resnet = Input(x_shape[1:], name=name+'_signal_input')
-    
-    if not is_2d:
-        x = BatchNormalization(name=name+'_BN_input')(signal_input_resnet)
-        #x = TrainableHighPass(alpha_init=0.9, name=name+'_high_pass')(x)
-        #x = DownSample2(name=name+'_downsample2')(x)
-    
-    x = feature_denoising(x if not is_2d else signal_input_resnet, filters[0], kernel_size[0], dropout if apply_dropout[0] else 0, name=name, signal_qty=signal_qty, padding=padding, is_2d=is_2d)
-    
-    for i in range(1, len(filters)):
-        if not is_resnet[i]:
-            x = conv_bn_relu(x, filters[i], kernel_size[i], name=name, line=i+1, decay=decay, padding=padding, signal_qty=signal_qty, is_2d=is_2d)
-        else:
-            downsample = filters[i] < filters[i-1]
-            x = resnet_block(x, filters[i], kernel_size[i], name=name, line=i+1, attention=attention, downsample=downsample, signal_qty=signal_qty, is_2d=is_2d)
+        # Fit the model
+        if fit_params is None:
+            fit_params = {}
             
-        if apply_dropout[i]:
-            x = Dropout(dropout, name=name+f'_drop_{i+1}')(x)
-            
-        if apply_pooling[i]:
-            if not is_2d:
-                x = AveragePooling1D(pool_size=pooling[i], name=name+f'_pool_{i+1}')(x)
-            #elif x_shape[2] > 1 and is_2d:
-            #    x = AveragePooling3D(pool_size=(pooling[i], pooling[i], pooling[i]), name=name+f'_pool_{i+1}', padding=padding)(x)
-            else:
-                x = AveragePooling2D(pool_size=pooling[i], name=name+f'_pool_{i+1}', padding=padding)(x)
+        history = model.fit(xtr, ytr, batch_size=32, epochs=epochs, validation_data=(xval, yval), verbose=1, callbacks=[es, mc, clr], **fit_params)
         
-    #x = Flatten(name=name+'_flatten')(x)    
-    if is_2d:
-        x = GlobalAveragePooling2D(name=name+'_gap')(x)
-    else:
-        x = GlobalAveragePooling1D(name=name+'_gap')(x)
+        logger.info(f'================== {model_name} Model history')
+        logger.info(history.history.keys())
+        plt.plot(history.history['loss'], label='Training')
+        plt.plot(history.history['val_loss'], label='Validation')
+        plt.legend()
+        plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
+        plt.clf()
         
-    x = Dense(128, activation='relu', name=name+'_dense1')(x)
-    x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
-    x = Dropout(dropout, name=name+'_drop_final_2')(x)
-    if regress:
-        x = Dense(1, activation='linear', name=name+'_output')(x)
-    model_resnet = Model(inputs=signal_input_resnet, outputs=x, name=name)    
-    
-    if regress:
-        model_resnet.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
-    
-    return model_resnet
-
-def conv_bn_relu(x, filters, kernel_size, padding='valid', name='', line=0, decay=1e-5, signal_qty=1, is_2d=False, grouping=False):
-    if not is_2d:
-        x = Conv1D(filters=filters*(signal_qty if grouping else 1), kernel_size=kernel_size, groups=signal_qty if grouping else 1, padding=padding, kernel_regularizer=l2(decay), name=name+'_Conv_'+str(line))(x)
-    #elif signal_qty > 1 and is_2d:
-    #    x = Conv3D(filters=filters, kernel_size=(kernel_size, kernel_size, kernel_size), padding=padding, kernel_regularizer=l2(decay), name=name+'_Conv_'+str(line))(x)
-    else:
-        x = Conv2D(filters=filters*(signal_qty if grouping else 1), kernel_size=kernel_size, groups=signal_qty if grouping else 1, padding=padding, kernel_regularizer=l2(decay), name=name+'_Conv_'+str(line))(x)
+        model = load_model('best_model.h5', compile=False)       
+        total_time = time.time() - start_time
+        model_results['time'] = total_time
+        model_results['history'] = history.history
         
-    x = BatchNormalization(name=name+'_BN_'+str(line))(x)
-    x = Activation('relu', name=name+'_ReLU_'+str(line))(x)
-    return x
-
-def create_lstm(learning_r=1e-3,
-                decay=1e-5,
-                dropout=0.2,
-                x_shape=[1,1],
-                name='LSTM',
-                hidden_units=[128, 128, 128, 128, 128, 128]):
-    signal_input_lstm = Input((x_shape[1], x_shape[2]), name=name+'_signal_input')  
-    #print('In: ', signal_input_lstm.shape)
-    x = BatchNormalization(name=name+'_BN_input')(signal_input_lstm)
-    
-    #x = TrainableHighPass(alpha_init=0.9, name=name+'_high_pass')(x)
-    #print('HP: ', x.shape)
-    #x = DownSample2(name=name+'_downsample2')(x)
-    #print('HP: ', x.shape)
-    
-    for i in range(len(hidden_units)):
-        if i == len(hidden_units)-1: #Last, no return_sequences
-            x = Bidirectional(LSTM(hidden_units[i], kernel_regularizer=l2(decay)), name=name+f'_{i+1}')(x)
-        else: #Rest
-            x = Bidirectional(LSTM(hidden_units[i], return_sequences=True, kernel_regularizer=l2(decay)), name=name+f'_{i+1}')(x)
-        x = LayerNormalization(name=name+f'_BN_{i+1}')(x)
-
-    x = Lambda(lambda x: tf.expand_dims(x, axis=1))(x)  # Add height dimension
-    x = GlobalAveragePooling1D(name=name+'_gap')(x)
+    evaluate_save_model(model, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder, y_min=y_min, y_max=y_max)
+    with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
+        outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
         
-    x = Dense(128, activation='relu', name=name+'_dense1')(x)
-    x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
-    x = Dropout(dropout, name=name+'_drop_final_2')(x)
-    x = Dense(1, activation='linear', name=name+'_output')(x)
+    logger.info("--- %s seconds ---" % (total_time))
+    logger.info(f'================== {model_name} model trained')
     
-    model_lstm = Model(inputs=signal_input_lstm, outputs=x, name=name)    
-    model_lstm.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
-
-    return model_lstm
-
-def create_bigru(learning_r=1e-3,
-                decay=1e-5,
-                dropout=0.2,
-                x_shape=[1,1],
-                name='BiGRU',
-                hidden_units=[128, 128, 128, 128, 128, 128]):
-    signal_input_bigru = Input((x_shape[1], x_shape[2]), name=name+'_signal_input')
-    x = BatchNormalization(name=name+'_BN_input')(signal_input_bigru)
+    return model
     
-    #x = TrainableHighPass(alpha_init=0.9, name=name+'_high_pass')(x)
-    #x = DownSample2(name=name+'_downsample2')(x)
-    
-    for i in range(len(hidden_units)):
-        if i == len(hidden_units)-1: #Last, no return_sequences
-            x = Bidirectional(GRU(hidden_units[i], kernel_regularizer=l2(decay)), name=name+f'_{i+1}')(x)
-        else: #Rest
-            x = Bidirectional(GRU(hidden_units[i], return_sequences=True, kernel_regularizer=l2(decay)), name=name+f'_{i+1}')(x)
-        x = LayerNormalization(name=name+f'_LN_{i+1}')(x)
-        
-    x = Lambda(lambda x: tf.expand_dims(x, axis=1))(x)  # Add height dimension
-    x = GlobalAveragePooling1D(name=name+'_gap')(x)
-        
-    x = Dense(128, activation='relu', name=name+'_dense1')(x)
-    x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
-    x = Dropout(dropout, name=name+'_drop_final_2')(x)
-    x = Dense(1, activation='linear', name=name+'_output')(x)
-    
-    model_bigru = Model(inputs=signal_input_bigru, outputs=x, name=name)    
-    model_bigru.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
-
-    return model_bigru
-
-def create_cnn(learning_r=1e-3,
-               decay=1e-5,
-               dropout=0.2,
-               x_shape=[1,1],
-               name='CNN',
-               filters=[32, 64, 64, 64, 64, 128, 128, 128, 128, 128, 256],
-               kernel_size=[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
-               pooling=[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
-               apply_dropout=[True, False, False, False, False, False, False, False, False, False, False],
-               apply_pooling=[True, False, True, False, True, False, False, True, False, True, False],
-               scalogram_cwt=None):  
-    is_2d = scalogram_cwt is not None
-    padding = 'valid' if x_shape[2] == 1 else 'same'
-    signal_qty = x_shape[-1]
-
-    signal_input_cnn = Input(x_shape[1:], name=name+'_signal_input')
-    #print('In: ', signal_input_cnn.shape)
-
-    if not is_2d:
-        x = BatchNormalization(name=name+'_BN_input')(signal_input_cnn)
-    
-        #x = TrainableHighPass(alpha_init=0.9, name=name+'_high_pass')(x)
-        #print('HP: ', x.shape)
-        #x = DownSample2(name=name+'_downsample2')(x)
-        #print('Down: ', x.shape)
-    
-    x = conv_bn_relu(x if not is_2d else signal_input_cnn, filters[0], kernel_size[0], name=name, line=1, decay=decay, padding=padding, signal_qty=signal_qty, is_2d=is_2d, grouping=True)
-    if apply_pooling[0]:
-        if not is_2d:
-            x = AveragePooling1D(pooling[0], name=name+'_pool_1')(x)
-        else:
-            x = AveragePooling2D(pool_size=pooling[0], name=name+'_pool_1', padding=padding)(x)
-    if apply_dropout[0]:
-        x = Dropout(dropout, name=name+'_drop_1')(x)
-    
-    for i in range(1, len(filters)):
-        #print('Layer:',i, ' - Filters:', filters[i], 'Size:', kernel_size[i], 'Apply pooling:',apply_pooling[i],'Size:',pooling[i], 'X shape:', x.shape)
-        
-        x = conv_bn_relu(x, filters[i], kernel_size[i], name=name, line=i+1, decay=decay, padding=padding, signal_qty=signal_qty, is_2d=is_2d)
-        if apply_pooling[i]:
-            if not is_2d:
-                x = AveragePooling1D(pool_size=pooling[i], name=name+f'_pool_{i+1}')(x)
-            else:
-                x = AveragePooling2D(pool_size=pooling[i], name=name+f'_pool_{i+1}', padding=padding)(x)
-        if apply_dropout[i]:
-            x = Dropout(dropout, name=name+f'_drop_{i+1}')(x)
-        
-    #x = Flatten(name=name+'_flatten')(x)    
-    if is_2d:
-        x = GlobalAveragePooling2D(name=name+'_gap')(x)
-    else:
-        x = GlobalAveragePooling1D(name=name+'_gap')(x)
-        
-    x = Dense(128, activation='relu', name=name+'_dense1')(x)
-    x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
-    x = Dropout(dropout, name=name+'_drop_final_2')(x)
-    x = Dense(1, activation='linear', name=name+'_output')(x)
-    model_cnn = Model(inputs=signal_input_cnn, outputs=x, name=name)
-    
-    model_cnn.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
-    
-    return model_cnn
-
-def create_ensemble(learning_r=1e-3,
-                    decay=1e-5,
-                    dropout=0.2,
-                    xproc_shape=[1,1],
-                    name='ens',
-                    hidden_units=[128, 128],
-                    model_list=[],
-                    proc_input=False,
-                    freeze_base=True):# update all layers in all base learners to not be trainable
-    if len(model_list) > 0:
-        if freeze_base:
-            for i in range(len(model_list)):
-                model = model_list[i]
-                for layer in model.layers:
-                    # make not trainable
-                    layer.trainable = False
-                    #rename to avoid 'unique layer name' issue
-                    #layer._name = 'ensemble_' + str(i+1) + '_' + layer.name
-    
-        if proc_input:
-            process_input = Input(shape=(xproc_shape[1],), name='process_input')
-            y = Dense(xproc_shape[1], activation='linear', name='process_output')(process_input)
-            model_process_input = Model(inputs=process_input, outputs=y, name='process_data')
-
-        # define multi-headed input concatenating inputs from all models
-        ensemble_inputs = [model.input for model in model_list]
-        if proc_input:
-            ensemble_inputs.append(model_process_input.input)
-        # concatenate output from all models
-        ensemble_outputs = [model.layers[-1].output for model in model_list]
-        if proc_input:
-            ensemble_outputs.append(model_process_input.output)
-
-        #merge outputs of the models
-        merge = concatenate(ensemble_outputs, name=name+'_concat')
-        x = BatchNormalization(name=name+'_concat_BN')(merge)
-        
-        for i in range(len(hidden_units)):
-            x = Dense(hidden_units[i], activation='relu', kernel_regularizer=l2(decay), name=name+f'_{i+1}')(x)
-            x = BatchNormalization(name=name+f'_BN_{i+1}')(x)
-            
-        if dropout != 0:
-            x = Dropout(dropout, name=name+f'_drop_{i+1}')(x)
-            
-        x = Dense(1, activation='linear', name=name+'_output')(x)
-        model_ens = Model(inputs=ensemble_inputs, outputs=x)
-
-        model_ens.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
-        return model_ens
-    else:
-        return None
+def create_proc_model(base_model_fn, base_model_params, ensemble_params):
+    base_model = base_model_fn(**base_model_params)
+    ensemble_params['model_list'] = [base_model]
+    return create_ensemble(**ensemble_params)
 
 def main(epochs=300, 
         sliding_window_size=250,
@@ -445,7 +196,6 @@ def main(epochs=300,
         run = '',
         resume_training=False):
     results = []
-    model_list = []
     
     folder = f'manual_sw{sliding_window_size}_ss{sliding_window_stride}'
     Path(folder).mkdir(parents=True, exist_ok=True)
@@ -469,7 +219,7 @@ def main(epochs=300,
         console_handler.setLevel(logging.INFO)
         
         # Create a formatter and add it to the handlers
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')#logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
     
@@ -515,6 +265,14 @@ def main(epochs=300,
         xval, xval_proc, yval = nasa_val_base.data.cpu().data.numpy(), nasa_val_base.proc_data.cpu().data.numpy(), nasa_val_base.targets.cpu().data.numpy()
         xte, xte_proc, yte = nasa_test_base.data.cpu().data.numpy(), nasa_test_base.proc_data.cpu().data.numpy(), nasa_test_base.targets.cpu().data.numpy()
         
+        # Normalize targets
+        y_min = 0
+        y_max = 0.4
+        
+        ytr = (ytr - y_min) / (y_max - y_min)
+        yval = (yval - y_min) / (y_max - y_min)
+        yte = (yte - y_min) / (y_max - y_min)
+        
         logger.info(f'X train: {xtr.shape}')
         logger.info(f'X valid: {xval.shape}')
         logger.info(f'X test: {xte.shape}')
@@ -524,6 +282,7 @@ def main(epochs=300,
         logger.info(f'Y train: {ytr.shape}')
         logger.info(f'Y valid: {yval.shape}')
         logger.info(f'Y test: {yte.shape}')
+        
         index = 0      
 
         #plot_signals(xtr, nasa_train_base.get_signal_list(), signal_chanel=2)
@@ -550,7 +309,8 @@ def main(epochs=300,
                 if cwt_transform == 'strans':
                     xte_cwt = convert_to_stransform(xte, description='S-transform for test set')
                 else:
-                    xte_cwt = convert_to_cwt(xte, description='CWT for test set') 
+                    xte_cwt = convert_to_cwt(xte, description='CWT for test set')
+                
                 xte_cwt = (xte_cwt - cwt_mean) / cwt_scale
                 cwt_time_te = time.time() - cwt_time_te
                 
@@ -565,512 +325,209 @@ def main(epochs=300,
                 xval_cwt = np.copy(xval)
                 xte_cwt = np.copy(xte)
 
-            if use_big_model:
-                model_name = "Xception"
-                logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-                index += 1
-                es = None
-                mc = None
-                es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience, min_delta=es_min_delta, restore_best_weights=True)
-                mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-                clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-                start_time = time.time()
-                model_results = {
-                    'model_name' : model_name,
-                    'scalogram' : str(cwt_transform),
-                    'cwt_time_tr': cwt_time_tr,
-                    'cwt_time_te': cwt_time_te,
+            trained_models = {}
+
+            model_configs = [
+                {
+                    'name': 'Xception',
+                    'create_fn': create_xception,
+                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'x_shape': xtr_cwt.shape, 'scalogram_cwt': cwt_transform},
+                    'data': (xtr_cwt, xval_cwt, xte_cwt),
+                    'patience': es_patience
+                },
+                {
+                    'name': 'CNN',
+                    'create_fn': create_cnn,
+                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'scalogram_cwt': cwt_transform},
+                    'data': (xtr_cwt, xval_cwt, xte_cwt),
+                    'patience': es_patience
+                },
+                {
+                    'name': 'LSTM',
+                    'create_fn': create_lstm,
+                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
+                    'data': (xtr, xval, xte), # LSTM uses raw data
+                    'patience': es_patience_lstm,
+                    'epochs': 1000
+                },
+                {
+                    'name': 'BiGRU',
+                    'create_fn': create_bigru,
+                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
+                    'data': (xtr, xval, xte), # BiGRU uses raw data
+                    'patience': es_patience_lstm,
+                    'epochs': 1000
                 }
+            ]
             
-                print(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-                matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-                if len(matches) > 0 and resume_training:
-                    logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                    model_res101 = load_model(matches[0], compile=False)
-                    with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                        model_results = json.load(fp)
-                    total_time = model_results['time']
-                    logger.info(f'================== Model {model_name} for run {run} loaded')
-                else:
-                    logger.info(f'================== Training {model_name} for run {run}')
-                    model_res101 = create_xception(learning_r=1e-3, decay=1e-5, x_shape=xtr_cwt.shape, scalogram_cwt=cwt_transform)
-            
-                    # Feed the image classifier with training data.
-                    history = model_res101.fit(xtr_cwt, ytr, batch_size=32, epochs=epochs, validation_data=(xval_cwt, yval), verbose=1, callbacks=[es, mc, clr])
-                    logger.info(f'================== {model_name} Model history')
-                    logger.info(history.history.keys())
-                    plt.plot(history.history['loss'], label='Training')
-                    plt.plot(history.history['val_loss'], label='Validation')
-                    plt.legend()
-                    plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                    plt.clf()
-                    model_res101 = load_model('best_model.h5', compile=False)       
-                    total_time = time.time() - start_time
-                    model_results['time'] = total_time
-                    model_results['history'] = history.history
-                    
-                evaluate_save_model(model_res101, model_name, index, xte_cwt, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                    outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                    
-                model_list.append(model_res101)
-                logger.info("--- %s seconds ---" % (total_time))
-                logger.info(f'================== {model_name} model trained')
+            # Remove Xception if the big model is not used
+            if not use_big_model:
+                model_configs = model_configs[1:]
 
-            model_name = "CNN"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            index += 1
-            es = None
-            mc = None
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience, min_delta=es_min_delta, restore_best_weights=True)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            print(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_cnn = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-                model_cnn = create_cnn(learning_r=1e-3, decay=1e-5, dropout=0.2, x_shape=xtr_cwt.shape, scalogram_cwt=cwt_transform)
-        
-                # Feed the image classifier with training data.
-                history = model_cnn.fit(xtr_cwt, ytr, batch_size=32, epochs=epochs, validation_data=(xval_cwt, yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_cnn = load_model('best_model.h5', compile=False)       
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
-                
-            evaluate_save_model(model_cnn, model_name, index, xte_cwt, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_cnn)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
+            for config in model_configs:
+                index += 1
+                model = train_model(
+                    model_name=config['name'],
+                    create_fn=config['create_fn'],
+                    train_data=(config['data'][0], ytr),
+                    val_data=(config['data'][1], yval),
+                    test_data=(config['data'][2], yte),
+                    folder=folder,
+                    run=run,
+                    cwt_transform=cwt_transform,
+                    epochs=config.get('epochs', epochs),
+                    resume_training=resume_training,
+                    logger=logger,
+                    index=index,
+                    results=results,
+                    cwt_times=(cwt_time_tr, cwt_time_te),
+                    model_params=config['params'],
+                    patience=config['patience'],
+                    y_min=y_min,
+                    y_max=y_max
+                )
+                trained_models[config['name']] = model
 
-            epochs = 1000
-            
-            model_name = "LSTM"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience_lstm, min_delta=es_min_delta, restore_best_weights=True)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            logger.info(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_lstm = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-                model_lstm = create_lstm(learning_r=1e-3, decay=1e-5, dropout=0.2, x_shape=xtr.shape)
-        
-                # Feed the image classifier with training data.
-                history = model_lstm.fit(xtr, ytr, batch_size=32, epochs=epochs, validation_data=(xval, yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_lstm = load_model('best_model.h5', compile=False)            
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
+            # Ensemble
+            if all(k in trained_models for k in ['LSTM', 'BiGRU', 'CNN']):
+                index += 1
+                ensemble_input = [xtr, xtr, xtr_cwt]
+                ensemble_val = [xval, xval, xval_cwt]
+                ensemble_test = [xte, xte, xte_cwt]
                 
-            evaluate_save_model(model_lstm, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_lstm)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
-            
-            model_name = "BiGRU"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            index += 1
-            es = None
-            mc = None
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience_lstm, min_delta=es_min_delta, restore_best_weights=True)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            logger.info(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_gru = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-                model_gru = create_bigru(learning_r=1e-3, decay=1e-5, dropout=0.2, x_shape=xtr.shape)
-        
-                # Feed the image classifier with training data.
-                history = model_gru.fit(xtr, ytr, batch_size=32, epochs=epochs, validation_data=(xval, yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_gru = load_model('best_model.h5', compile=False)       
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
-                
-            evaluate_save_model(model_gru, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_gru)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
-                        
-            model_name = "Ensemble"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            index += 1
-            es = None
-            mc = None
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience, min_delta=es_min_delta, restore_best_weights=True)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            logger.info(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_ens = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-            
-                model_ens = create_ensemble(learning_r=1e-3,
-                                decay=1e-5,
-                                dropout=0.2,
-                                xproc_shape=xtr_proc.shape,
-                                name=model_name,
-                                hidden_units=[64, 32],
-                                model_list=[model_lstm, model_gru, model_cnn])
-                # plot graph of ensemble
-                plot_model(model_ens, show_shapes=True, to_file=f'{folder}/DL_ensemble_graph_{run}_{cwt_transform}.png')
-                
-                X = [xtr, xtr, xtr_cwt]# if i != 1 or xtr.shape[2] == 1 else np.expand_dims(xtr_cwt, axis=-1) for i in range(len(model_ens.input))]
-                X_VAL = [xval, xval, xval_cwt]# if i != 1 or xtr.shape[2] == 1 else np.expand_dims(xval_cwt, axis=-1) for i in range(len(model_ens.input))]
+                train_model(
+                    model_name='Ensemble',
+                    create_fn=create_ensemble,
+                    train_data=(ensemble_input, ytr),
+                    val_data=(ensemble_val, yval),
+                    test_data=(ensemble_test, yte),
+                    folder=folder,
+                    run=run,
+                    cwt_transform=cwt_transform,
+                    epochs=epochs,
+                    resume_training=resume_training,
+                    logger=logger,
+                    index=index,
+                    results=results,
+                    cwt_times=(cwt_time_tr, cwt_time_te),
+                    model_params={
+                        'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 
+                        'xproc_shape': xtr_proc.shape, 'name': 'Ensemble', 
+                        'hidden_units': [64, 32], 
+                        'model_list': [trained_models['LSTM'], trained_models['BiGRU'], trained_models['CNN']]
+                    },
+                    patience=es_patience,
+                    plot_graph=True,
+                    y_min=y_min,
+                    y_max=y_max
+                )
 
-                history = model_ens.fit(X, ytr, batch_size=32, epochs=epochs, validation_data=(X_VAL, yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_ens = load_model('best_model.h5', compile=False)       
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
-                
-            X = [xte, xte, xte_cwt]# if i != 1 or xtr.shape[2] == 1 else np.expand_dims(xte_cwt, axis=-1) for i in range(len(model_ens.input))]
-            #X.append(xte_proc_e)
-            evaluate_save_model(model_ens, model_name, index, X, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_ens)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
+            # ResNet Variants
+            resnet_configs = [
+                {
+                    'name': 'ResNet',
+                    'create_fn': create_resnet,
+                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': True, 'attention': False, 'scalogram_cwt': cwt_transform},
+                    'data': (xtr_cwt, xval_cwt, xte_cwt),
+                    'patience': es_patience,
+                    'plot_graph': True,
+                    'epochs': 500
+                },
+                {
+                    'name': 'RobustResNet',
+                    'create_fn': create_resnet,
+                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': True, 'attention': True, 'scalogram_cwt': cwt_transform},
+                    'data': (xtr_cwt, xval_cwt, xte_cwt),
+                    'patience': es_patience,
+                    'plot_graph': True,
+                    'epochs': 500
+                }
+            ]
 
-            epochs = 500
+            for config in resnet_configs:
+                index += 1
+                train_model(
+                    model_name=config['name'],
+                    create_fn=config['create_fn'],
+                    train_data=(config['data'][0], ytr),
+                    val_data=(config['data'][1], yval),
+                    test_data=(config['data'][2], yte),
+                    folder=folder,
+                    run=run,
+                    cwt_transform=cwt_transform,
+                    epochs=config.get('epochs', epochs),
+                    resume_training=resume_training,
+                    logger=logger,
+                    index=index,
+                    results=results,
+                    cwt_times=(cwt_time_tr, cwt_time_te),
+                    model_params=config['params'],
+                    patience=config['patience'],
+                    plot_graph=config.get('plot_graph', False),
+                    y_min=y_min,
+                    y_max=y_max
+                )
+
+            # Proc Models (ResNetProc, RobustResNetProc)
+            # These are tricky because they use create_ensemble internally in the original code
+            # We need to adapt the create_fn or wrap it.
+            # In original code: 
+            # 1. create_resnet(..., regress=False) -> base model
+            # 2. create_ensemble(..., model_list=[base_model], proc_input=True) -> final model
             
-            model_name = "ResNet"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            index += 1
-            es = None
-            mc = None
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience, min_delta=es_min_delta, restore_best_weights=True)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            logger.info(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_resnet = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-                model_resnet = create_resnet(learning_r=1e-3, decay=1e-5, dropout=0.2, x_shape=xtr_cwt.shape, regress=True, attention=False, scalogram_cwt=cwt_transform)
-        
-                # plot graph of ensemble
-                plot_model(model_resnet, show_shapes=True, to_file=f'{folder}/DL_{model_name}_graph_{run}_{cwt_transform}.png')
+            proc_configs = [
+                {
+                    'name': 'ResNetProc',
+                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': False, 'scalogram_cwt': cwt_transform},
+                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'ResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                    'patience': es_patience
+                },
+                {
+                    'name': 'RobustResNetProc',
+                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': True, 'scalogram_cwt': cwt_transform},
+                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'RobustResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                    'patience': es_patience
+                }
+            ]
+
+            for config in proc_configs:
+                index += 1
+                # We need a wrapper lambda to pass to train_model
+                # But train_model expects create_fn(**model_params). 
+                # So we can pass create_proc_model as create_fn and merge params.
                 
-                # Feed the image classifier with training data.
-                history = model_resnet.fit(xtr_cwt, ytr, batch_size=32, epochs=epochs, validation_data=(xval_cwt, yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_resnet = load_model('best_model.h5', compile=False)       
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
-                
-            evaluate_save_model(model_resnet, model_name, index, xte_cwt, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_resnet)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
-            
-            model_name = "RobustResNet"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            index += 1
-            es = None
-            mc = None
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience, min_delta=es_min_delta, restore_best_weights=True)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            logger.info(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_robresnet = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-                model_robresnet = create_resnet(learning_r=1e-3, decay=1e-5, dropout=0.2, x_shape=xtr_cwt.shape, regress=True, attention=True, scalogram_cwt=cwt_transform)
-        
-                # plot graph of ensemble
-                plot_model(model_robresnet, show_shapes=True, to_file=f'{folder}/DL_{model_name}_graph_{run}_{cwt_transform}.png')
-                
-                # Feed the image classifier with training data.
-                history = model_robresnet.fit(xtr_cwt, ytr, batch_size=32, epochs=epochs, validation_data=(xval_cwt, yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_robresnet = load_model('best_model.h5', compile=False)       
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
-                
-            evaluate_save_model(model_robresnet, model_name, index, xte_cwt, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_robresnet)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
-            
-            model_name = "ResNetProc"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            index += 1
-            es = None
-            mc = None
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience, min_delta=es_min_delta)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            logger.info(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_ens_res = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-                model_resnet_tmp = create_resnet(learning_r=1e-3, decay=1e-5, dropout=0.2, x_shape=xtr_cwt.shape, regress=False, attention=False, scalogram_cwt=cwt_transform)
-                model_ens_res = create_ensemble(learning_r=1e-3,
-                                decay=1e-5,
-                                dropout=0.2,
-                                xproc_shape=xtr_proc.shape,
-                                name=model_name,
-                                hidden_units=[64, 32],
-                                model_list=[model_resnet_tmp], 
-                                proc_input=True,
-                                freeze_base=False)
-                # plot graph of ensemble
-                plot_model(model_ens_res, show_shapes=True, to_file=f'{folder}/DL_{model_name}_graph_{run}_{cwt_transform}.png')
-        
-                # Feed the image classifier with training data.
-                history = model_ens_res.fit([xtr_cwt, xtr_proc], ytr, batch_size=32, epochs=epochs, validation_data=([xval_cwt, xval_proc], yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_ens_res = load_model('best_model.h5', compile=False)       
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
-                
-            evaluate_save_model(model_ens_res, model_name, index, [xte_cwt, xte_proc], yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_ens_res)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
-            
-            model_name = "RobustResNetProc"
-            logger.info(f'\n================== Training {model_name} with {cwt_transform} as CWT transform')
-            index += 1
-            es = None
-            mc = None
-            es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=es_patience, min_delta=es_min_delta, restore_best_weights=True)
-            mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=1, save_best_only=True)
-            clr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_delta=0.001, min_lr=1e-5)
-            start_time = time.time()
-            model_results = {
-                'model_name' : model_name,
-                'scalogram' : str(cwt_transform),
-                'cwt_time_tr': cwt_time_tr,
-                'cwt_time_te': cwt_time_te,
-            }
-        
-            logger.info(f'Look for file {folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            matches = glob.glob(f'{folder}/DL_{model_name}_{run}_{cwt_transform}_*.h5')
-            if len(matches) > 0 and resume_training:
-                logger.info(f'================== Skipping training of {model_name} for run {run} - {matches[0]} exists already, loading file...')
-                model_ens_robres = load_model(matches[0], compile=False)
-                with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json') as fp:
-                    model_results = json.load(fp)
-                total_time = model_results['time']
-                logger.info(f'================== Model {model_name} for run {run} loaded')
-            else:
-                logger.info(f'================== Training {model_name} for run {run}')
-                model_robresnet_tmp = create_resnet(learning_r=1e-3, decay=1e-5, dropout=0.2, x_shape=xtr_cwt.shape, regress=False, attention=True, scalogram_cwt=cwt_transform)
-                model_ens_robres = create_ensemble(learning_r=1e-3,
-                                decay=1e-5,
-                                dropout=0.2,
-                                xproc_shape=xtr_proc.shape,
-                                name=model_name,
-                                hidden_units=[64, 32],
-                                model_list=[model_robresnet_tmp], 
-                                proc_input=True,
-                                freeze_base=False)
-                # plot graph of ensemble
-                plot_model(model_ens_robres, show_shapes=True, to_file=f'{folder}/DL_{model_name}_graph_{run}_{cwt_transform}.png')
-        
-                # Feed the image classifier with training data.
-                history = model_ens_robres.fit([xtr_cwt, xtr_proc], ytr, batch_size=32, epochs=epochs, validation_data=([xval_cwt, xval_proc], yval), verbose=1, callbacks=[es, mc, clr])
-                logger.info(f'================== {model_name} Model history')
-                logger.info(history.history.keys())
-                plt.plot(history.history['loss'], label='Training')
-                plt.plot(history.history['val_loss'], label='Validation')
-                plt.legend()
-                plt.savefig(f"{folder}/DL_{model_name}_{run}_{cwt_transform}_training_loss_{run}_{cwt_transform}.png")
-                plt.clf()
-                model_ens_robres = load_model('best_model.h5', compile=False)       
-                total_time = time.time() - start_time
-                model_results['time'] = total_time
-                model_results['history'] = history.history
-                
-            evaluate_save_model(model_ens_robres, model_name, index, [xte_cwt, xte_proc], yte, f'{run}_{cwt_transform}', results, model_results, folder=folder)
-            with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
-                outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
-                
-            model_list.append(model_ens_robres)
-            logger.info("--- %s seconds ---" % (total_time))
-            logger.info(f'================== {model_name} model trained')
+                # Construct merged params
+                merged_params = {
+                    'base_model_fn': create_resnet,
+                    'base_model_params': config['base_params'],
+                    'ensemble_params': config['ensemble_params']
+                }
+
+                train_model(
+                    model_name=config['name'],
+                    create_fn=create_proc_model,
+                    train_data=([xtr_cwt, xtr_proc], ytr),
+                    val_data=([xval_cwt, xval_proc], yval),
+                    test_data=([xte_cwt, xte_proc], yte),
+                    folder=folder,
+                    run=run,
+                    cwt_transform=cwt_transform,
+                    epochs=500, # From original code
+                    resume_training=resume_training,
+                    logger=logger,
+                    index=index,
+                    results=results,
+                    cwt_times=(cwt_time_tr, cwt_time_te),
+                    model_params=merged_params,
+                    patience=config['patience'],
+                    plot_graph=True,
+                    y_min=y_min,
+                    y_max=y_max
+                )
 
             xtr_cwt = None
-            xval_cwt_cwt = None
-            xte_cwt_cwt = None
+            xval_cwt = None
+            xte_cwt = None
     
         df = pd.DataFrame(results).drop(['history'], axis=1)
         df.to_csv(f'{folder}/DL_{run}_scores.csv',sep=';',decimal='.')
