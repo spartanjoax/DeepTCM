@@ -5,10 +5,11 @@ from keras.optimizers import Adam
 from keras.regularizers import l2
 from keras.losses import Huber
 from keras.applications import Xception
-from keras import backend as K
+#from keras import backend as K
+from keras import ops
 
 def root_mse(y_test, y_pred):
-    return K.sqrt(K.mean(K.square(y_pred - y_test)))
+    return ops.sqrt(ops.mean(ops.square(y_pred - y_test)))
 
 def conv_bn_relu(x, filters, kernel_size, padding='valid', name='', line=0, decay=1e-5, signal_qty=1, is_2d=False, grouping=False):
     if not is_2d:
@@ -78,7 +79,7 @@ def create_xception(learning_r=1e-3,
     
     model_resnet = Model(inputs=signal_input_resnet, outputs=x, name=name)    
     
-    model_resnet.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
+    model_resnet.compile(loss=Huber(delta=0.5), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
     
     return model_resnet
 
@@ -137,7 +138,7 @@ def create_resnet(learning_r=1e-3,
     model_resnet = Model(inputs=signal_input_resnet, outputs=x, name=name)    
     
     if regress:
-        model_resnet.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
+        model_resnet.compile(loss=Huber(delta=0.5), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
     
     return model_resnet
 
@@ -167,7 +168,7 @@ def create_lstm(learning_r=1e-3,
     x = Dense(1, activation='linear', name=name+'_output')(x)
     
     model_lstm = Model(inputs=signal_input_lstm, outputs=x, name=name)    
-    model_lstm.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
+    model_lstm.compile(loss=Huber(delta=0.5), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
 
     return model_lstm
 
@@ -197,7 +198,7 @@ def create_bigru(learning_r=1e-3,
     x = Dense(1, activation='linear', name=name+'_output')(x)
     
     model_bigru = Model(inputs=signal_input_bigru, outputs=x, name=name)    
-    model_bigru.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
+    model_bigru.compile(loss=Huber(delta=0.5), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
 
     return model_bigru
 
@@ -252,7 +253,7 @@ def create_cnn(learning_r=1e-3,
     x = Dense(1, activation='linear', name=name+'_output')(x)
     model_cnn = Model(inputs=signal_input_cnn, outputs=x, name=name)
     
-    model_cnn.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
+    model_cnn.compile(loss=Huber(delta=0.5), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
     
     return model_cnn
 
@@ -297,7 +298,7 @@ def create_ensemble(learning_r=1e-3,
         x = Dense(1, activation='linear', name=name+'_output')(x)
         model_ens = Model(inputs=ensemble_inputs, outputs=x)
 
-        model_ens.compile(loss=Huber(delta=0.1), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
+        model_ens.compile(loss=Huber(delta=0.5), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])
         return model_ens
     else:
         return None

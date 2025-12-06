@@ -216,3 +216,18 @@ __marimo__/
 *.tf
 *.keras
 *.h5
+manual*/
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.svg
+*.pdf
+
+# Docker
+Dockerfile

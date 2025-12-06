@@ -30,7 +30,7 @@ from models import create_xception, create_resnet, create_lstm, create_bigru, cr
 # Clear all previously registered custom objects
 saving.get_custom_objects().clear()
 
-from helpers import compute_mean_std, CWTLayer, TrainableHighPass, convert_to_cwt, DownSample2, convert_to_stransform, plot_signals
+from helpers import compute_mean_std, convert_to_cwt, convert_to_stransform#, TrainableHighPass, DownSample2
 from data import NASA_Dataset, StdScalerTransform, MinMaxScalerTransform
 
 from keras import backend as K
@@ -55,16 +55,15 @@ use_big_model = True
 es_patience=50
 es_patience_lstm=50
 es_min_delta=0.0005
-seed=42
 split_type='runs'
 split_ratios = (0.64, 0.16, 0.2) #(0.48, 0.12, 0.4) 
 
 data_transform_cwt = [
     #'morl',
-    #'strans'
+    'strans',
     #'cmor',
+    'cwt',
     None
-    #'cwt'
 ]
 
 class NumpyFloatValuesEncoder(json.JSONEncoder):
@@ -80,7 +79,7 @@ def get_scores(y_test, y_pred):
     mape = mean_absolute_percentage_error(y_test, y_pred)
     return rmse, r2, mae, mape
 
-def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, results, model_results, folder=None, y_min=0, y_max=1):
+def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, results, model_results, folder=None, y_min=0, y_max=1, log_target=False):
     # Evaluate the model on the test set
     start_time = time.time()
     ypred = model.predict(x_test)
@@ -88,8 +87,14 @@ def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, resu
     model_results['eval_time'] = total_time
     
     # Inverse transform predictions and targets
+    # First inverse MinMax
     ypred_orig = ypred * (y_max - y_min) + y_min
     y_test_orig = y_test * (y_max - y_min) + y_min
+    
+    # Then inverse Log if applied
+    if log_target:
+        ypred_orig = np.exp(ypred_orig) - 1e-6
+        y_test_orig = np.exp(y_test_orig) - 1e-6
     
     rmse, r2, mae, mape = get_scores(y_test_orig, ypred_orig)
     print(f'RMSE: {rmse:.5f}\nR2: {r2:.5f}\nMAE: {mae:.5f}\nMAPE: {mape:.5f}')
@@ -114,7 +119,7 @@ def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, resu
 def train_model(model_name, create_fn, train_data, val_data, test_data, 
                 folder, run, cwt_transform, epochs, resume_training, 
                 logger, index, results, cwt_times, model_params=None, fit_params=None, 
-                patience=50, plot_graph=False, y_min=0, y_max=1):
+                patience=50, plot_graph=False, y_min=0, y_max=1, log_target=False):
     
     xtr, ytr = train_data
     xval, yval = val_data
@@ -176,7 +181,7 @@ def train_model(model_name, create_fn, train_data, val_data, test_data,
         model_results['time'] = total_time
         model_results['history'] = history.history
         
-    evaluate_save_model(model, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder, y_min=y_min, y_max=y_max)
+    evaluate_save_model(model, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder, y_min=y_min, y_max=y_max, log_target=log_target)
     with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
         outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
         
@@ -194,10 +199,15 @@ def main(epochs=300,
         sliding_window_size=250,
         sliding_window_stride=25,
         run = '',
-        resume_training=False):
+        resume_training=False,
+        seed=42,
+        test_mode=False,
+        log_target=False):
     results = []
     
-    folder = f'manual_sw{sliding_window_size}_ss{sliding_window_stride}'
+    folder = f'manual_sw{sliding_window_size}_ss{sliding_window_stride}_seed{seed}'
+    if log_target:
+        folder += '_log'
     Path(folder).mkdir(parents=True, exist_ok=True)
     
     if not os.path.exists(f'{folder}/DL_{run}_scores.csv') or not resume_training:
@@ -266,8 +276,16 @@ def main(epochs=300,
         xte, xte_proc, yte = nasa_test_base.data.cpu().data.numpy(), nasa_test_base.proc_data.cpu().data.numpy(), nasa_test_base.targets.cpu().data.numpy()
         
         # Normalize targets
-        y_min = 0
-        y_max = 0.4
+        if log_target:
+            ytr = np.log(ytr + 1e-6)
+            yval = np.log(yval + 1e-6)
+            yte = np.log(yte + 1e-6)
+
+            y_min = np.min(ytr)
+            y_max = np.max(ytr)
+        else:
+            y_min = 0
+            y_max = 0.4
         
         ytr = (ytr - y_min) / (y_max - y_min)
         yval = (yval - y_min) / (y_max - y_min)
@@ -298,12 +316,20 @@ def main(epochs=300,
                     xtr_cwt = convert_to_cwt(xtr, description='CWT for train set')
                     xval_cwt = convert_to_cwt(xval, description='CWT for validation set')
                 
+                logger.info('Normalizing CWT scalograms...')
+
                 cwt_mean = np.mean(xtr_cwt, axis=(0, 1, 2), keepdims=True)  # (1, 1, 1, C)
                 cwt_scale = np.std(xtr_cwt, axis=(0, 1, 2), keepdims=True) + 1e-8
+
+                logger.info(f'X CWT mean: {cwt_mean.shape}')
+                logger.info(f'X CWT scale: {cwt_scale.shape}')
+
                 xtr_cwt = (xtr_cwt - cwt_mean) / cwt_scale
                 xval_cwt = (xval_cwt - cwt_mean) / cwt_scale
                 
                 cwt_time_tr = time.time() - cwt_time_tr
+
+                logger.info(f'X CWT for train and val calculated in {cwt_time_tr:.2f} seconds')
                 
                 cwt_time_te = time.time()
                 if cwt_transform == 'strans':
@@ -364,6 +390,9 @@ def main(epochs=300,
             if not use_big_model:
                 model_configs = model_configs[1:]
 
+            if test_mode:
+                model_configs = [config for config in model_configs if config['name'] == 'CNN']
+
             for config in model_configs:
                 index += 1
                 model = train_model(
@@ -384,12 +413,13 @@ def main(epochs=300,
                     model_params=config['params'],
                     patience=config['patience'],
                     y_min=y_min,
-                    y_max=y_max
+                    y_max=y_max,
+                    log_target=log_target
                 )
                 trained_models[config['name']] = model
 
             # Ensemble
-            if all(k in trained_models for k in ['LSTM', 'BiGRU', 'CNN']):
+            if all(k in trained_models for k in ['LSTM', 'BiGRU', 'CNN']) and not test_mode:
                 index += 1
                 ensemble_input = [xtr, xtr, xtr_cwt]
                 ensemble_val = [xval, xval, xval_cwt]
@@ -419,30 +449,34 @@ def main(epochs=300,
                     patience=es_patience,
                     plot_graph=True,
                     y_min=y_min,
-                    y_max=y_max
+                    y_max=y_max,
+                    log_target=log_target
                 )
 
             # ResNet Variants
-            resnet_configs = [
-                {
-                    'name': 'ResNet',
-                    'create_fn': create_resnet,
-                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': True, 'attention': False, 'scalogram_cwt': cwt_transform},
-                    'data': (xtr_cwt, xval_cwt, xte_cwt),
-                    'patience': es_patience,
-                    'plot_graph': True,
-                    'epochs': 500
-                },
-                {
-                    'name': 'RobustResNet',
-                    'create_fn': create_resnet,
-                    'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': True, 'attention': True, 'scalogram_cwt': cwt_transform},
-                    'data': (xtr_cwt, xval_cwt, xte_cwt),
-                    'patience': es_patience,
-                    'plot_graph': True,
-                    'epochs': 500
-                }
-            ]
+            if test_mode:
+                resnet_configs = []
+            else:
+                resnet_configs = [
+                    {
+                        'name': 'ResNet',
+                        'create_fn': create_resnet,
+                        'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': True, 'attention': False, 'scalogram_cwt': cwt_transform},
+                        'data': (xtr_cwt, xval_cwt, xte_cwt),
+                        'patience': es_patience,
+                        'plot_graph': True,
+                        'epochs': 500
+                    },
+                    {
+                        'name': 'RobustResNet',
+                        'create_fn': create_resnet,
+                        'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': True, 'attention': True, 'scalogram_cwt': cwt_transform},
+                        'data': (xtr_cwt, xval_cwt, xte_cwt),
+                        'patience': es_patience,
+                        'plot_graph': True,
+                        'epochs': 500
+                    }
+                ]
 
             for config in resnet_configs:
                 index += 1
@@ -465,36 +499,30 @@ def main(epochs=300,
                     patience=config['patience'],
                     plot_graph=config.get('plot_graph', False),
                     y_min=y_min,
-                    y_max=y_max
+                    y_max=y_max,
+                    log_target=log_target
                 )
 
-            # Proc Models (ResNetProc, RobustResNetProc)
-            # These are tricky because they use create_ensemble internally in the original code
-            # We need to adapt the create_fn or wrap it.
-            # In original code: 
-            # 1. create_resnet(..., regress=False) -> base model
-            # 2. create_ensemble(..., model_list=[base_model], proc_input=True) -> final model
-            
-            proc_configs = [
-                {
-                    'name': 'ResNetProc',
-                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': False, 'scalogram_cwt': cwt_transform},
-                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'ResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
-                    'patience': es_patience
-                },
-                {
-                    'name': 'RobustResNetProc',
-                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': True, 'scalogram_cwt': cwt_transform},
-                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'RobustResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
-                    'patience': es_patience
-                }
-            ]
+            if test_mode:
+                proc_configs = []
+            else:
+                proc_configs = [
+                    {
+                        'name': 'ResNetProc',
+                        'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': False, 'scalogram_cwt': cwt_transform},
+                        'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'ResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                        'patience': es_patience
+                    },
+                    {
+                        'name': 'RobustResNetProc',
+                        'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': True, 'scalogram_cwt': cwt_transform},
+                        'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'RobustResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                        'patience': es_patience
+                    }
+                ]
 
             for config in proc_configs:
                 index += 1
-                # We need a wrapper lambda to pass to train_model
-                # But train_model expects create_fn(**model_params). 
-                # So we can pass create_proc_model as create_fn and merge params.
                 
                 # Construct merged params
                 merged_params = {
@@ -522,7 +550,8 @@ def main(epochs=300,
                     patience=config['patience'],
                     plot_graph=True,
                     y_min=y_min,
-                    y_max=y_max
+                    y_max=y_max,
+                    log_target=log_target
                 )
 
             xtr_cwt = None
@@ -547,18 +576,22 @@ if __name__ == "__main__":
     sliding_window_size=250
     sliding_window_stride=50
     resume_training=True
+    test_mode=True
+    log_target=[False,True]
 
     print('Args received: ', sys.argv[1:])
 
-    opts, args = getopt.getopt(sys.argv[1:],"he:p:c:r:")
+    opts, args = getopt.getopt(sys.argv[1:],"he:p:c:r:t")
     for opt, arg in opts:
       if opt == '-h':
-        print ('DL_manual_regression.py\n\t-a <apply_averaging (1 or 0)>\n\t-e <epochs>\n\t-w <average_window_size>\n\t-p <preload_model_file>\n\t-r <resume_training (1 or 0)>')
+        print ('DL_manual_regression.py\n\t-a <apply_averaging (1 or 0)>\n\t-e <epochs>\n\t-w <average_window_size>\n\t-p <preload_model_file>\n\t-r <resume_training (1 or 0)>\n\t-t <test_mode>')
         sys.exit()
       elif opt in ("-e"):
         epochs = int(arg)
       elif opt in ("-r"):
         resume_training = arg == "1"
+      elif opt in ("-t"):
+        test_mode = True
 
     if resume_training:
         print(f'================== Resuming training')
@@ -571,7 +604,13 @@ if __name__ == "__main__":
     print('Press any key to begin')
     inp = input()
 
-    for run_name in ['all']:#,'AC_table','AC','DC','DC_table','ACDC']:
-        print(f'================== Training {run_name}')
-        main(epochs=epochs, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
-            run=run_name, resume_training=resume_training)
+    seeds = [42, 43, 44, 45, 46]
+
+    for seed in seeds:
+        print(f'================== Training with seed {seed}')
+        for lt in log_target:
+            print(f'================== Log transform for target values: {lt}')
+            for run_name in ['all']:#,'AC_table','AC','DC','DC_table','ACDC']:
+                print(f'================== Training {run_name}')
+                main(epochs=epochs, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
+                    run=run_name, resume_training=resume_training, seed=seed, test_mode=test_mode, log_target=lt)
