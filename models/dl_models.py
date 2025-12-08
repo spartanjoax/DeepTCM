@@ -131,7 +131,7 @@ def create_resnet(learning_r=1e-3,
         
     x = Dense(128, activation='relu', name=name+'_dense1')(x)
     x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
+    x = Dense(64, activation='relu', name=name+'_dense2')(x)
     x = Dropout(dropout, name=name+'_drop_final_2')(x)
     if regress:
         x = Dense(1, activation='linear', name=name+'_output')(x)
@@ -163,7 +163,7 @@ def create_lstm(learning_r=1e-3,
         
     x = Dense(128, activation='relu', name=name+'_dense1')(x)
     x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
+    x = Dense(64, activation='relu', name=name+'_dense2')(x)
     x = Dropout(dropout, name=name+'_drop_final_2')(x)
     x = Dense(1, activation='linear', name=name+'_output')(x)
     
@@ -193,7 +193,7 @@ def create_bigru(learning_r=1e-3,
         
     x = Dense(128, activation='relu', name=name+'_dense1')(x)
     x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
+    x = Dense(64, activation='relu', name=name+'_dense2')(x)
     x = Dropout(dropout, name=name+'_drop_final_2')(x)
     x = Dense(1, activation='linear', name=name+'_output')(x)
     
@@ -248,7 +248,7 @@ def create_cnn(learning_r=1e-3,
         
     x = Dense(128, activation='relu', name=name+'_dense1')(x)
     x = Dropout(dropout, name=name+'_drop_final')(x)
-    x = Dense(128, activation='relu', name=name+'_dense2')(x)
+    x = Dense(64, activation='relu', name=name+'_dense2')(x)
     x = Dropout(dropout, name=name+'_drop_final_2')(x)
     x = Dense(1, activation='linear', name=name+'_output')(x)
     model_cnn = Model(inputs=signal_input_cnn, outputs=x, name=name)
@@ -262,7 +262,7 @@ def create_ensemble(learning_r=1e-3,
                     dropout=0.2,
                     xproc_shape=[1,1],
                     name='ens',
-                    hidden_units=[128, 128],
+                    hidden_units=[128, 64],
                     model_list=[],
                     proc_input=False,
                     freeze_base=True):

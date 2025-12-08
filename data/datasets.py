@@ -31,7 +31,9 @@ class NASA_Dataset(Dataset):
                  signal_group='all', 
                  debug_plots=False, 
                  sliding_window_size=250,
-                 sliding_window_stride=25):
+                 sliding_window_stride=25,
+                 runs_per_case_test_val=1,
+                 split_offset=0):
         """
         Custom DataLoader for the NASA-Ames face-milling dataset with train/val/test split support.
 
@@ -126,31 +128,53 @@ class NASA_Dataset(Dataset):
                 n = len(runs)
                 if n == 0:
                     continue
-                # deterministic shuffle per-case
+                
+                # Random shuffle based on seed
                 rng = np.random.RandomState(self.seed + int(c))
                 perm = rng.permutation(n)
                 runs_shuffled = runs[perm]
-
-                # select test runs, ensure at least 1 run per case for test when test_ratio>0
-                if test_ratio > 0:
-                    test_count = max(1, int(np.round(test_ratio * n)))
-                    # limit test_count to at most n (if it becomes > n)
-                    test_count = min(test_count, n)
+                
+                if runs_per_case_test_val > 0:
+                    # New logic: Cyclic selection based on offset
+                    # Sort runs (already sorted by np.unique)
+                    # Rotate runs by split_offset
+                    effective_offset = split_offset % n
+                    runs_ordered = np.concatenate((runs_shuffled[effective_offset:], runs_shuffled[:effective_offset]))
+                    
+                    # Select Test
+                    test_sel = runs_ordered[:runs_per_case_test_val]
+                    
+                    # Select Val
+                    val_sel = runs_ordered[runs_per_case_test_val : 2 * runs_per_case_test_val]
+                    
+                    # Select Train (rest)
+                    tr = runs_ordered[2 * runs_per_case_test_val :]
+                    vl = val_sel
+                    
                 else:
-                    test_count = 0
-                test_sel = runs_shuffled[:test_count]
+                    # Old logic: 
+                    # deterministic shuffle per-case
 
-                # remaining runs to be split into train/val
-                remaining = runs_shuffled[test_count:]
-                if val_ratio > 0 and len(remaining) > 1:
-                    rel_val = val_ratio / (train_ratio + val_ratio)
-                    tr, vl = train_test_split(
-                        remaining, test_size=rel_val, random_state=self.seed
-                    )
-                else:
-                    # not enough runs to create a per-case validation split -> assign all to train
-                    tr = remaining
-                    vl = np.array([], dtype=int)
+                    # select test runs, ensure at least 1 run per case for test when test_ratio>0
+                    if test_ratio > 0:
+                        test_count = max(1, int(np.round(test_ratio * n)))
+                        # limit test_count to at most n (if it becomes > n)
+                        test_count = min(test_count, n)
+                    else:
+                        test_count = 0
+                    test_sel = runs_shuffled[:test_count]
+
+                    # remaining runs to be split into train/val
+                    remaining = runs_shuffled[test_count:]
+                    if val_ratio > 0 and len(remaining) > 1:
+                        rel_val = val_ratio / (train_ratio + val_ratio)
+                        tr, vl = train_test_split(
+                            remaining, test_size=rel_val, random_state=self.seed
+                        )
+                    else:
+                        # not enough runs to create a per-case validation split -> assign all to train
+                        tr = remaining
+                        vl = np.array([], dtype=int)
 
                 # collect (case, run) pairs
                 for r in tr:

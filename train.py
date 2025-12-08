@@ -5,6 +5,7 @@
 
 import sys, getopt
 import glob
+import gc
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1' 
@@ -79,22 +80,22 @@ def get_scores(y_test, y_pred):
     mape = mean_absolute_percentage_error(y_test, y_pred)
     return rmse, r2, mae, mape
 
-def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, results, model_results, folder=None, y_min=0, y_max=1, log_target=False):
+def evaluate_save_model(model, model_name, index, x_test, y_test, 
+                        run_name, results, model_results, folder=None, 
+                        y_min=0, y_max=1, norm_target=False):
     # Evaluate the model on the test set
     start_time = time.time()
     ypred = model.predict(x_test)
     total_time = time.time() - start_time
     model_results['eval_time'] = total_time
     
-    # Inverse transform predictions and targets
-    # First inverse MinMax
-    ypred_orig = ypred * (y_max - y_min) + y_min
-    y_test_orig = y_test * (y_max - y_min) + y_min
-    
-    # Then inverse Log if applied
-    if log_target:
-        ypred_orig = np.exp(ypred_orig) - 1e-6
-        y_test_orig = np.exp(y_test_orig) - 1e-6
+    # Inverse MinMax predictions and targets
+    if norm_target:
+        ypred_orig = ypred * (y_max - y_min) + y_min
+        y_test_orig = y_test * (y_max - y_min) + y_min
+    else:
+        ypred_orig = ypred
+        y_test_orig = y_test
     
     rmse, r2, mae, mape = get_scores(y_test_orig, ypred_orig)
     print(f'RMSE: {rmse:.5f}\nR2: {r2:.5f}\nMAE: {mae:.5f}\nMAPE: {mape:.5f}')
@@ -119,7 +120,7 @@ def evaluate_save_model(model, model_name, index, x_test, y_test, run_name, resu
 def train_model(model_name, create_fn, train_data, val_data, test_data, 
                 folder, run, cwt_transform, epochs, resume_training, 
                 logger, index, results, cwt_times, model_params=None, fit_params=None, 
-                patience=50, plot_graph=False, y_min=0, y_max=1, log_target=False):
+                patience=50, plot_graph=False, y_min=0, y_max=1, norm_target=False):
     
     xtr, ytr = train_data
     xval, yval = val_data
@@ -181,7 +182,7 @@ def train_model(model_name, create_fn, train_data, val_data, test_data,
         model_results['time'] = total_time
         model_results['history'] = history.history
         
-    evaluate_save_model(model, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder, y_min=y_min, y_max=y_max, log_target=log_target)
+    evaluate_save_model(model, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder, y_min=y_min, y_max=y_max, norm_target=norm_target)
     with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
         outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
         
@@ -202,12 +203,16 @@ def main(epochs=300,
         resume_training=False,
         seed=42,
         test_mode=False,
-        log_target=False):
+        norm_target=False,
+        runs_per_case_test_val=1,
+        split_offset=0):
     results = []
     
     folder = f'manual_sw{sliding_window_size}_ss{sliding_window_stride}_seed{seed}'
-    if log_target:
-        folder += '_log'
+    if norm_target:
+        folder += '_targetnorm'
+    if runs_per_case_test_val > 0:
+        folder += f'_rpc{runs_per_case_test_val}_off{split_offset}'
     Path(folder).mkdir(parents=True, exist_ok=True)
     
     if not os.path.exists(f'{folder}/DL_{run}_scores.csv') or not resume_training:
@@ -259,16 +264,16 @@ def main(epochs=300,
         minmax_transform = MinMaxScalerTransform(min=proc_min, max=proc_max)
 
         # Compute mean and std for the training data
-        train_dataset = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios,sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type)
+        train_dataset = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios,sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
         mean, std = compute_mean_std(train_dataset)
         # Define normalisation transform
         normalize_transform = StdScalerTransform(mean=mean, std=std)
     
-        nasa_train_base = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type)
+        nasa_train_base = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
         logger.info(f"Train runs: {nasa_train_base.train_runs}")
-        nasa_val_base = NASA_Dataset(split='val', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type)
+        nasa_val_base = NASA_Dataset(split='val', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
         logger.info(f"Val runs: {nasa_train_base.val_runs}", )
-        nasa_test_base = NASA_Dataset(split='test', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type)
+        nasa_test_base = NASA_Dataset(split='test', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
         logger.info(f"Test runs: {nasa_train_base.test_runs}", )
     
         xtr, xtr_proc, ytr = nasa_train_base.data.cpu().data.numpy(), nasa_train_base.proc_data.cpu().data.numpy(), nasa_train_base.targets.cpu().data.numpy()
@@ -276,20 +281,16 @@ def main(epochs=300,
         xte, xte_proc, yte = nasa_test_base.data.cpu().data.numpy(), nasa_test_base.proc_data.cpu().data.numpy(), nasa_test_base.targets.cpu().data.numpy()
         
         # Normalize targets
-        if log_target:
-            ytr = np.log(ytr + 1e-6)
-            yval = np.log(yval + 1e-6)
-            yte = np.log(yte + 1e-6)
-
-            y_min = np.min(ytr)
-            y_max = np.max(ytr)
-        else:
+        if norm_target:
             y_min = 0
             y_max = 0.4
         
-        ytr = (ytr - y_min) / (y_max - y_min)
-        yval = (yval - y_min) / (y_max - y_min)
-        yte = (yte - y_min) / (y_max - y_min)
+            ytr = (ytr - y_min) / (y_max - y_min)
+            yval = (yval - y_min) / (y_max - y_min)
+            yte = (yte - y_min) / (y_max - y_min)
+        else:
+            y_min = 0
+            y_max = 1
         
         logger.info(f'X train: {xtr.shape}')
         logger.info(f'X valid: {xval.shape}')
@@ -414,7 +415,7 @@ def main(epochs=300,
                     patience=config['patience'],
                     y_min=y_min,
                     y_max=y_max,
-                    log_target=log_target
+                    norm_target=norm_target
                 )
                 trained_models[config['name']] = model
 
@@ -450,7 +451,7 @@ def main(epochs=300,
                     plot_graph=True,
                     y_min=y_min,
                     y_max=y_max,
-                    log_target=log_target
+                    norm_target=norm_target
                 )
 
             # ResNet Variants
@@ -500,7 +501,7 @@ def main(epochs=300,
                     plot_graph=config.get('plot_graph', False),
                     y_min=y_min,
                     y_max=y_max,
-                    log_target=log_target
+                    norm_target=norm_target
                 )
 
             if test_mode:
@@ -551,7 +552,7 @@ def main(epochs=300,
                     plot_graph=True,
                     y_min=y_min,
                     y_max=y_max,
-                    log_target=log_target
+                    norm_target=norm_target
                 )
 
             xtr_cwt = None
@@ -570,14 +571,26 @@ def main(epochs=300,
             logger.removeHandler(handler)
             handler.close()
 
+        # Memory cleanup
+        del xtr, xval, xte, xtr_cwt, xval_cwt, xte_cwt, trained_models, results, nasa_train_base, nasa_val_base, nasa_test_base
+        try:
+            del model
+        except:
+            pass
+        
+        K.clear_session()
+        gc.collect()
+
 if __name__ == "__main__":
     
     epochs=500
     sliding_window_size=250
-    sliding_window_stride=50
+    sliding_window_stride=125
     resume_training=True
     test_mode=True
-    log_target=[False,True]
+    norm_target=[False,True]
+    runs_per_case_test_val=1
+    split_offsets=[0, 1, 2, 3, 4]
 
     print('Args received: ', sys.argv[1:])
 
@@ -604,13 +617,15 @@ if __name__ == "__main__":
     print('Press any key to begin')
     inp = input()
 
-    seeds = [42, 43, 44, 45, 46]
+    seed = 42
 
-    for seed in seeds:
-        print(f'================== Training with seed {seed}')
-        for lt in log_target:
-            print(f'================== Log transform for target values: {lt}')
+    print(f'================== Training with seed {seed}')
+    for nt in norm_target:
+        print(f'================== Normalisation for target values: {nt}')
+        for offset in split_offsets:
+            print(f'================== Split offset: {offset}')
             for run_name in ['all']:#,'AC_table','AC','DC','DC_table','ACDC']:
                 print(f'================== Training {run_name}')
                 main(epochs=epochs, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
-                    run=run_name, resume_training=resume_training, seed=seed, test_mode=test_mode, log_target=lt)
+                    run=run_name, resume_training=resume_training, seed=seed, test_mode=test_mode, norm_target=nt,
+                    runs_per_case_test_val=runs_per_case_test_val, split_offset=offset)
