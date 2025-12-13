@@ -6,12 +6,14 @@ from joblib import load, dump
 from tqdm import tqdm
 
 import scipy.io
+from scipy.stats import kurtosis, skew
 from sklearn.model_selection import train_test_split
 
 from helpers import plot_signals, plot_signals_dict, augment_signal, apply_moving_average, downsample, get_file_list, augment_dataset_softdtw, compute_min_max
 import data.mat_to_csv as mtc
 
 import torch
+from models.dl_models import create_cvae
 from torch.utils.data import Dataset
 
 allowed_signal_group = ['DC','DC_AE','DC_table','DC_Vib','table','all','AC','AC_AE','AC_table','AC_Vib','internals','ACDC']
@@ -19,7 +21,10 @@ allowed_signal_group = ['DC','DC_AE','DC_table','DC_Vib','table','all','AC','AC_
 class NASA_Dataset(Dataset):
 
     signal_list = ['smcAC', 'smcDC', 'vib_table', 'vib_spindle', 'AE_table', 'AE_spindle']
-    proc_variable_list = ['DOC', 'feed', 'material', 'Vc'] # Material is one of 1 (cast iron) and 2 (stainless steel)
+    BASE_PROC_VAR_LIST = ['DOC', 'feed', 'material', 'Vc'] # Material is one of 1 (cast iron) and 2 (stainless steel)
+    proc_variable_list = BASE_PROC_VAR_LIST.copy()
+    
+    TIME_DOMAIN_FEATURES = ['mean', 'var', 'rms', 'kurtosis', 'skewness', 'ptp']
 
     def __init__(self, 
                  transformX=None, 
@@ -33,7 +38,11 @@ class NASA_Dataset(Dataset):
                  sliding_window_size=250,
                  sliding_window_stride=25,
                  runs_per_case_test_val=1,
-                 split_offset=0):
+                 split_offset=0,
+                 use_cvae=False,
+                 cvae_model_file=None,
+                 cvae_scaler_file=None,
+                 cvae_samples_per_combo=200):
         """
         Custom DataLoader for the NASA-Ames face-milling dataset with train/val/test split support.
 
@@ -82,6 +91,10 @@ class NASA_Dataset(Dataset):
         self.seed = seed
         self.debug_plots = debug_plots
         self.signal_group = signal_group
+        self.use_cvae = use_cvae
+        self.cvae_model_file = cvae_model_file
+        self.cvae_scaler_file = cvae_scaler_file
+        self.cvae_samples_per_combo = cvae_samples_per_combo
 
         assert split in ['train','val','test'], f'Variable must be one of "train", "val", or "test"'
         assert split_type in ['runs', 'cases'], f'Variable must be one of "runs" or "cases"'
@@ -234,13 +247,75 @@ class NASA_Dataset(Dataset):
         print(f'================== Data augmented')
         print(f'Shapes -> X: {x.shape} - X process params: {x_process_params.shape} - Y: {y.shape}')
 
+        if self.use_cvae and self.cvae_model_file and self.cvae_scaler_file and split == 'train':
+            print('================== CVAE Enabled: Generating synthetic data')
+            x_synth, x_proc_synth, y_synth = self._generate_synthetic_cvae(x, x_process_params, y)
+             
+            # Append synthetic data
+            if len(x_synth) > 0:
+                x = np.vstack([x, x_synth])
+                x_process_params = np.vstack([x_process_params, x_proc_synth])
+                y = np.concatenate([y, y_synth])
+                print(f'Shapes after CVAE -> X: {x.shape} - X process params: {x_process_params.shape} - Y: {y.shape}')
+            else:
+                 print('================== CVAE generated no data (check path or logic)')
+
         # Compute min and max for each column
         if debug_plots:
             x_stat = np.asarray(x, dtype=float)
             for i, signal in enumerate(NASA_Dataset.signal_list):
                 print(f'Signal {signal}: Min = {np.min(x_stat[:,:,i])}, Max = {np.max(x_stat[:,:,i])}')
         
-        x = self.remove_signals(x)
+        print('================== Extracting time-domain features')
+        
+        # x is (N, W, C)
+        # We want features (N, C*6)
+        
+        N, W, C = x.shape
+        num_feats = len(NASA_Dataset.TIME_DOMAIN_FEATURES)
+        
+        # Pre-allocate
+        x_features = np.zeros((N, C * num_feats), dtype=np.float32)
+        
+        # Order: For each channel, [mean, var, rms, kurt, skew, ptp]
+        # features for channel i are at indices [i*6 : (i+1)*6]
+        
+        for c_idx in range(C):
+            sig_data = x[:, :, c_idx] # (N, W)
+            
+            # Mean
+            x_features[:, c_idx * num_feats + 0] = np.mean(sig_data, axis=1)
+            # Variance
+            x_features[:, c_idx * num_feats + 1] = np.var(sig_data, axis=1)
+            # RMS
+            x_features[:, c_idx * num_feats + 2] = np.sqrt(np.mean(sig_data**2, axis=1))
+            # Kurtosis
+            x_features[:, c_idx * num_feats + 3] = np.nan_to_num(kurtosis(sig_data, axis=1))
+            # Skewness
+            x_features[:, c_idx * num_feats + 4] = np.nan_to_num(skew(sig_data, axis=1))
+            # Peak-to-Peak
+            x_features[:, c_idx * num_feats + 5] = np.ptp(sig_data, axis=1)
+            
+        # Replace any remaining NaNs (just in case)
+        x_features = np.nan_to_num(x_features)
+
+        # Update proc_variable_list names
+        new_proc_names = []
+        for sig in NASA_Dataset.signal_list:
+            for feat in NASA_Dataset.TIME_DOMAIN_FEATURES:
+                new_proc_names.append(f"{sig}_{feat}")
+                
+        # Only update the class variable if it hasn't been updated yet (to avoid duplicates if re-instantiated)
+        # But commonly we want instance-specific, yet the consumer uses the class static list.
+        # Given the legacy design using class variable, we update it carefully or use instance var.
+        # The user requested "update the proc_variable_list".
+        NASA_Dataset.proc_variable_list = NASA_Dataset.BASE_PROC_VAR_LIST + new_proc_names
+
+        # Concatenate features to process params
+        # x_process_params is (N, 4)
+        x_process_params = np.hstack([x_process_params, x_features])
+
+        x, x_process_params = self.remove_signals(x, x_process_params)
 
         self.data = torch.Tensor(x).to(torch.float)
         self.proc_data = torch.Tensor(x_process_params).to(torch.float)
@@ -333,9 +408,9 @@ class NASA_Dataset(Dataset):
         #     plt.plot(data_file[(data_file['case'] == 15) & (data_file['run'] == 4)][signal])
         # plt.show()
 
-        x_proc_params = data_file[['case','run']+NASA_Dataset.proc_variable_list].copy().drop_duplicates()
+        x_proc_params = data_file[['case','run']+NASA_Dataset.BASE_PROC_VAR_LIST].copy().drop_duplicates()
         x_process_params = np.array(x_proc_params)
-        for proc_var in NASA_Dataset.proc_variable_list:
+        for proc_var in NASA_Dataset.BASE_PROC_VAR_LIST:
             print(f'{proc_var} - min: {x_proc_params[proc_var].min()} - max: {x_proc_params[proc_var].max()}')
 
         y = data_file[['case','run','VB']].copy().drop_duplicates()
@@ -404,11 +479,46 @@ class NASA_Dataset(Dataset):
             signals = ['smcAC', 'smcDC', 'vib_table', 'vib_spindle', 'AE_table', 'AE_spindle']
         return signals
 
-    def remove_signals(self, data):
+    def remove_signals(self, data, proc_data=None):
         idx = []
         signals = self.get_signal_list()
+        
+        # Find indices of signals to remove
         idx = [index for index, element in enumerate(NASA_Dataset.signal_list) if element not in signals]
+        
+        # Remove from signal data
         x = np.delete(data, idx, axis=2)
+        
+        if proc_data is not None:
+            # We also need to remove the corresponding features from proc_data
+            # proc_data structure: [DOC, feed, material, Vc] + [Sig1_Feats...] + [Sig2_Feats...] ...
+            # Base vars count
+            base_count = len(NASA_Dataset.BASE_PROC_VAR_LIST)
+            feats_per_sig = len(NASA_Dataset.TIME_DOMAIN_FEATURES)
+            
+            # Identify columns to drop
+            # For each removed signal index 'i' (in 0..5), we drop feature columns:
+            # base_count + i*6 ... base_count + (i+1)*6 - 1
+            
+            cols_to_drop = []
+            for i in idx:
+                start_col = base_count + i * feats_per_sig
+                end_col = start_col + feats_per_sig
+                cols_to_drop.extend(range(start_col, end_col))
+                
+            proc_data = np.delete(proc_data, cols_to_drop, axis=1)
+            
+            # Update proc_variable_list to reflect removal
+            # We reconstruct it based on kept signals
+            current_proc_vars = NASA_Dataset.BASE_PROC_VAR_LIST.copy()
+            for sig in signals: # These are the kept signals
+                for feat in NASA_Dataset.TIME_DOMAIN_FEATURES:
+                    current_proc_vars.append(f"{sig}_{feat}")
+            
+            NASA_Dataset.proc_variable_list = current_proc_vars
+            
+            return x, proc_data
+            
         return x
     
     def transpose_signals(data):
@@ -429,6 +539,107 @@ class NASA_Dataset(Dataset):
                 x.append(signals)
 
         return np.array(x)
+
+    def _generate_synthetic_cvae(self, x, x_process_params, y):
+        # 1. Load Scalers
+        if not os.path.exists(self.cvae_scaler_file):
+             print(f"CVAE Scaler file not found: {self.cvae_scaler_file}")
+             return [], [], []
+             
+        stats = load(self.cvae_scaler_file)
+        
+        sig_mean = stats['signal_mean']
+        sig_std = stats['signal_std']
+        proc_min = stats['proc_min']
+        proc_max = stats['proc_max']
+        target_min = stats['target_min']
+        target_max = stats['target_max']
+        
+        # 2. Load Model
+        # Need input dimensions from current data or saved?
+        # x is (N, W, C).
+        # Condition is (4 process + 1 target) = 5
+        N, W, C = x.shape
+        latent_dim = 16 # Keep consistent with training script
+        
+        cvae = create_cvae(input_shape=(W, C), label_dim=5, latent_dim=latent_dim,
+                           filters=[32, 64, 128], kernel_size=[3, 3, 3], strides=[2, 2, 2])
+        
+        if os.path.exists(self.cvae_model_file):
+            # Dummy call to initialize variables for subclassed model
+            _dummy_x = np.zeros((1, W, C), dtype=np.float32)
+            # Label dim is 5. But model expects specific inputs.
+            # Wrapper CVAE might take (x, y) in call?? No, create_cvae returns CVAE instance.
+            # CVAE class in dl_models uses call(inputs). inputs=[x, y].
+            # Let's check dl_models CVAE.call signature if possible, but standard is inputs.
+            # Actually, CVAE.call(inputs) where inputs=[x, condition].
+            _dummy_cond = np.zeros((1, 5), dtype=np.float32)
+            cvae([_dummy_x, _dummy_cond])
+            
+            cvae.load_weights(self.cvae_model_file)
+        else:
+             print(f"CVAE Model file not found: {self.cvae_model_file}")
+             return [], [], []
+             
+        decoder = cvae.decoder
+        
+        # 3. Identify unique process parameter combinations
+        # x_process_params contains Features too. Base params are first 4 (NASA_Dataset.BASE_PROC_VAR_LIST)
+        base_params = x_process_params[:, :4] # (N, 4)
+        unique_proc_combos = np.unique(base_params, axis=0) # (K, 4)
+        
+        print(f"CVAE: Found {len(unique_proc_combos)} unique process parameter combinations.")
+        
+        x_synth_list = []
+        y_synth_list = []
+        x_proc_synth_list = [] # Base params first
+        
+        # 4. Generate
+        for combo in unique_proc_combos:
+             # combo is [DOC, feed, mat, Vc]
+             
+             # Generate random targets for this combo
+             # Uniform 0 to 0.4
+             targets = np.random.uniform(0, 0.4, size=(self.cvae_samples_per_combo, 1))
+             
+             # Prepare condition vector (normalized)
+             # Repeat combo for all samples
+             combo_repeated = np.tile(combo, (self.cvae_samples_per_combo, 1))
+             
+             # Normalize combo
+             proc_range = proc_max - proc_min
+             proc_range[proc_range == 0] = 1.0
+             combo_norm = (combo_repeated - proc_min) / proc_range
+             
+             # Normalize target
+             target_range = target_max - target_min
+             target_range[target_range == 0] = 1.0
+             target_norm = (targets - target_min) / target_range
+             
+             # Concat
+             condition = np.hstack([combo_norm, target_norm])
+             
+             # Sample Z
+             z_sample = np.random.normal(size=(self.cvae_samples_per_combo, latent_dim))
+             
+             # Decode
+             x_gen_norm = decoder.predict([z_sample, condition], verbose=0)
+             
+             # Denormalize Signal
+             x_gen = x_gen_norm * (sig_std + 1e-8) + sig_mean
+             
+             x_synth_list.append(x_gen)
+             y_synth_list.append(targets.flatten()) # flatten to 1D
+             x_proc_synth_list.append(combo_repeated)
+
+        if len(x_synth_list) == 0:
+             return [], [], []
+             
+        x_synth = np.vstack(x_synth_list) # (Total_Synth, W, C)
+        y_synth = np.concatenate(y_synth_list) # (Total_Synth,)
+        x_proc_synth = np.vstack(x_proc_synth_list) # (Total_Synth, 4)
+        
+        return x_synth, x_proc_synth, y_synth
 
 class MU_TCM_Dataset(Dataset):
 

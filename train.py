@@ -31,8 +31,10 @@ from models import create_xception, create_resnet, create_lstm, create_bigru, cr
 # Clear all previously registered custom objects
 saving.get_custom_objects().clear()
 
-from helpers import compute_mean_std, convert_to_cwt, convert_to_stransform#, TrainableHighPass, DownSample2
+from helpers import compute_mean_std, compute_min_max, convert_to_cwt, convert_to_stransform, convert_to_fsst, get_scores#, TrainableHighPass, DownSample2
 from data import NASA_Dataset, StdScalerTransform, MinMaxScalerTransform
+from train_vae import train_cvae
+import os
 
 from keras import backend as K
 
@@ -52,7 +54,7 @@ sns.set(font_scale = 1)
 bgcolor=''
 color=['hls','Plasma']
 
-use_big_model = True
+use_big_model = False
 es_patience=50
 es_patience_lstm=50
 es_min_delta=0.0005
@@ -61,9 +63,10 @@ split_ratios = (0.64, 0.16, 0.2) #(0.48, 0.12, 0.4)
 
 data_transform_cwt = [
     #'morl',
-    'strans',
+    #'strans',
     #'cmor',
     'cwt',
+    'fsst',
     None
 ]
 
@@ -167,7 +170,7 @@ def train_model(model_name, create_fn, train_data, val_data, test_data,
         if fit_params is None:
             fit_params = {}
             
-        history = model.fit(xtr, ytr, batch_size=32, epochs=epochs, validation_data=(xval, yval), verbose=1, callbacks=[es, mc, clr], **fit_params)
+        history = model.fit(xtr, ytr, batch_size=16, epochs=epochs, validation_data=(xval, yval), verbose=1, callbacks=[es, mc, clr], **fit_params)
         
         logger.info(f'================== {model_name} Model history')
         logger.info(history.history.keys())
@@ -205,7 +208,8 @@ def main(epochs=300,
         test_mode=False,
         norm_target=False,
         runs_per_case_test_val=1,
-        split_offset=0):
+        split_offset=0,
+        use_cvae=False):
     results = []
     
     folder = f'manual_sw{sliding_window_size}_ss{sliding_window_stride}_seed{seed}'
@@ -213,8 +217,27 @@ def main(epochs=300,
         folder += '_targetnorm'
     if runs_per_case_test_val > 0:
         folder += f'_rpc{runs_per_case_test_val}_off{split_offset}'
+    if use_cvae:
+        folder += '_cvae'
     Path(folder).mkdir(parents=True, exist_ok=True)
     
+    # CVAE Handling
+    cvae_model_file = None
+    cvae_scaler_file = None
+    if use_cvae:
+        output_dir = 'vae_results'
+        cvae_model_file = os.path.join(output_dir, 'cvae_weightsv2.h5')
+        cvae_scaler_file = os.path.join(output_dir, 'vae_scaler_stats.joblib')
+        
+        if not os.path.exists(cvae_model_file) or not os.path.exists(cvae_scaler_file):
+            print("================== CVAE Model or Scaler not found. Training CVAE...")
+            train_cvae(sliding_window_size=sliding_window_size, 
+                       sliding_window_stride=sliding_window_stride,
+                       output_dir=output_dir,
+                       epochs=200)
+        else:
+            print("================== CVAE Model found. Using existing weights.")
+
     if not os.path.exists(f'{folder}/DL_{run}_scores.csv') or not resume_training:
 
         # Get the current d.ate and time
@@ -259,17 +282,33 @@ def main(epochs=300,
         material - min: 1 - max: 2
         Vc - min: 50.0 - max: 200.0
         """
-        proc_min = [0.1, 0.05, 1, 50] # DOC, feed, material, Vc
-        proc_max = [1.5, 0.5, 2, 200] # DOC, feed, material, Vc
-        minmax_transform = MinMaxScalerTransform(min=proc_min, max=proc_max)
+        #proc_min = [0.1, 0.05, 1, 50] # DOC, feed, material, Vc
+        #proc_max = [1.5, 0.5, 2, 200] # DOC, feed, material, Vc
 
         # Compute mean and std for the training data
-        train_dataset = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios,sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
+        train_dataset = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios,sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
+                                     use_cvae=use_cvae, cvae_model_file=cvae_model_file, cvae_scaler_file=cvae_scaler_file)
         mean, std = compute_mean_std(train_dataset)
+        
+        # Compute min and max for process params (now includes time-domain features)
+        proc_min, proc_max = compute_min_max(train_dataset)
+        print(f"Process parameter min: {proc_min} max: {proc_max}")
+        proc_min[0] = 0.75
+        proc_min[1] = 0.05
+        proc_min[2] = 1
+        proc_min[3] = 50
+        proc_max[0] = 1.5
+        proc_max[1] = 0.5
+        proc_max[2] = 2
+        proc_max[3] = 200
+        print(f"Process parameter min: {proc_min} max: {proc_max}")
+        minmax_transform = MinMaxScalerTransform(min=proc_min, max=proc_max)
+        
         # Define normalisation transform
         normalize_transform = StdScalerTransform(mean=mean, std=std)
     
-        nasa_train_base = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
+        nasa_train_base = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
+                                       use_cvae=use_cvae, cvae_model_file=cvae_model_file, cvae_scaler_file=cvae_scaler_file)
         logger.info(f"Train runs: {nasa_train_base.train_runs}")
         nasa_val_base = NASA_Dataset(split='val', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
         logger.info(f"Val runs: {nasa_train_base.val_runs}", )
@@ -313,6 +352,9 @@ def main(epochs=300,
                 if cwt_transform == 'strans':
                     xtr_cwt = convert_to_stransform(xtr, gamma=0.1, description='S-transform for train set')
                     xval_cwt = convert_to_stransform(xval, gamma=0.1, description='S-transform for validation set')
+                elif cwt_transform == 'fsst':
+                    xtr_cwt = convert_to_fsst(xtr, description='FSST for train set')
+                    xval_cwt = convert_to_fsst(xval, description='FSST for validation set')
                 else:
                     xtr_cwt = convert_to_cwt(xtr, description='CWT for train set')
                     xval_cwt = convert_to_cwt(xval, description='CWT for validation set')
@@ -335,6 +377,8 @@ def main(epochs=300,
                 cwt_time_te = time.time()
                 if cwt_transform == 'strans':
                     xte_cwt = convert_to_stransform(xte, description='S-transform for test set')
+                elif cwt_transform == 'fsst':
+                    xte_cwt = convert_to_fsst(xte, description='FSST for test set')
                 else:
                     xte_cwt = convert_to_cwt(xte, description='CWT for test set')
                 
@@ -504,44 +548,83 @@ def main(epochs=300,
                     norm_target=norm_target
                 )
 
+            proc_configs = [
+                {
+                    'name': 'CNNProc',
+                    'base_fn': create_cnn,
+                    'input_type': 'cwt',
+                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'scalogram_cwt': cwt_transform},
+                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'CNNProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                    'patience': es_patience
+                },
+                {
+                    'name': 'LSTMProc',
+                    'base_fn': create_lstm,
+                    'input_type': 'raw',
+                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
+                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'LSTMProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                    'patience': es_patience_lstm,
+                    'epochs': 1000
+                },
+                {
+                    'name': 'BiGRUProc',
+                    'base_fn': create_bigru,
+                    'input_type': 'raw',
+                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
+                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'BiGRUProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                    'patience': es_patience_lstm,
+                    'epochs': 1000
+                },
+                {
+                    'name': 'ResNetProc',
+                    'base_fn': create_resnet,
+                    'input_type': 'cwt',
+                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': False, 'scalogram_cwt': cwt_transform},
+                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'ResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                    'patience': es_patience
+                },
+                {
+                    'name': 'RobustResNetProc',
+                    'base_fn': create_resnet,
+                    'input_type': 'cwt',
+                    'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': True, 'scalogram_cwt': cwt_transform},
+                    'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'RobustResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                    'patience': es_patience
+                }
+            ]
             if test_mode:
-                proc_configs = []
-            else:
-                proc_configs = [
-                    {
-                        'name': 'ResNetProc',
-                        'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': False, 'scalogram_cwt': cwt_transform},
-                        'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'ResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
-                        'patience': es_patience
-                    },
-                    {
-                        'name': 'RobustResNetProc',
-                        'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': True, 'scalogram_cwt': cwt_transform},
-                        'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'RobustResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
-                        'patience': es_patience
-                    }
-                ]
+                proc_configs = [config for config in proc_configs if config['name'] == 'CNNProc']
 
             for config in proc_configs:
                 index += 1
                 
                 # Construct merged params
                 merged_params = {
-                    'base_model_fn': create_resnet,
+                    'base_model_fn': config['base_fn'],
                     'base_model_params': config['base_params'],
                     'ensemble_params': config['ensemble_params']
                 }
+                
+                # Select data based on input_type
+                if config['input_type'] == 'cwt':
+                    x_train = [xtr_cwt, xtr_proc]
+                    x_val = [xval_cwt, xval_proc]
+                    x_test = [xte_cwt, xte_proc]
+                else: # raw
+                    x_train = [xtr, xtr_proc]
+                    x_val = [xval, xval_proc]
+                    x_test = [xte, xte_proc]
 
                 train_model(
                     model_name=config['name'],
                     create_fn=create_proc_model,
-                    train_data=([xtr_cwt, xtr_proc], ytr),
-                    val_data=([xval_cwt, xval_proc], yval),
-                    test_data=([xte_cwt, xte_proc], yte),
+                    train_data=(x_train, ytr),
+                    val_data=(x_val, yval),
+                    test_data=(x_test, yte),
                     folder=folder,
                     run=run,
                     cwt_transform=cwt_transform,
-                    epochs=500, # From original code
+                    epochs=config.get('epochs', 500), # Default to 500 if not specified
                     resume_training=resume_training,
                     logger=logger,
                     index=index,
@@ -588,9 +671,10 @@ if __name__ == "__main__":
     sliding_window_stride=125
     resume_training=True
     test_mode=True
-    norm_target=[False,True]
+    norm_target=[False]
     runs_per_case_test_val=1
-    split_offsets=[0, 1, 2, 3, 4]
+    split_offsets=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    use_cvae = [False, True]
 
     print('Args received: ', sys.argv[1:])
 
@@ -605,6 +689,8 @@ if __name__ == "__main__":
         resume_training = arg == "1"
       elif opt in ("-t"):
         test_mode = True
+      elif opt in ("-c"):
+        use_cvae = [arg == "1"]
 
     if resume_training:
         print(f'================== Resuming training')
@@ -622,10 +708,12 @@ if __name__ == "__main__":
     print(f'================== Training with seed {seed}')
     for nt in norm_target:
         print(f'================== Normalisation for target values: {nt}')
-        for offset in split_offsets:
-            print(f'================== Split offset: {offset}')
-            for run_name in ['all']:#,'AC_table','AC','DC','DC_table','ACDC']:
-                print(f'================== Training {run_name}')
-                main(epochs=epochs, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
-                    run=run_name, resume_training=resume_training, seed=seed, test_mode=test_mode, norm_target=nt,
-                    runs_per_case_test_val=runs_per_case_test_val, split_offset=offset)
+        for cvae in use_cvae:
+            print(f'================== CVAE: {cvae}')
+            for offset in split_offsets:
+                print(f'================== Split offset: {offset}')
+                for run_name in ['all']:#,'AC_table','AC','DC','DC_table','ACDC']:
+                    print(f'================== Training {run_name}')
+                    main(epochs=epochs, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
+                        run=run_name, resume_training=resume_training, seed=seed, test_mode=test_mode, norm_target=nt,
+                        runs_per_case_test_val=runs_per_case_test_val, split_offset=offset, use_cvae=cvae)

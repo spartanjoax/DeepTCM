@@ -2,6 +2,7 @@
 
 from sklearn.metrics import r2_score, root_mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
 from scipy.signal import resample
+from ssqueezepy import ssq_stft
 from torch import sqrt, mean
 
 import numpy as np
@@ -246,6 +247,7 @@ def convert_to_cwt(x, n_scales=200, wavelet='morl', description='CWT generation'
     
 def convert_to_stransform(x, lo=0, hi=125, gamma=1, description='S-transform generation'):
     """
+    Source: https://ieeexplore.ieee.org/abstract/document/492555
     data shape: (N, W, C) - N = Number of samples, W = Width of the sample (time), C = Channel
     returns: S-transform numpy array with shape: (N, H, W, C) - H = Height (frequency)
     """
@@ -255,6 +257,27 @@ def convert_to_stransform(x, lo=0, hi=125, gamma=1, description='S-transform gen
             stransf = st.st(x[n, :, c], hi=hi, lo=lo, gamma=gamma)
             cwt[n, :, :, c] = np.abs(stransf)
     return cwt
+
+def convert_to_fsst(x, fs=1.0, description='FSST generation'):
+    """
+    Apply Fourier Synchrosqueezed Transform (FSST) to signals using ssqueezepy.
+    data shape: (N, W, C)
+    returns: FSST magnitude array with shape: (N, F, T, C)
+    """
+    # Run once to get output shape
+    # ssq_stft returns tuple, first element is Tx
+    Tx, *_ = ssq_stft(x[0, :, 0])
+    F, T = Tx.shape
+    
+    # Pre-allocate. Note: output might be complex
+    fsst_out = np.empty((x.shape[0], F, T, x.shape[2]), dtype=np.float32)
+    
+    for n in tqdm(range(x.shape[0]), desc=description):
+        for c in range(x.shape[2]):
+            Tx, *_ = ssq_stft(x[n, :, c])
+            fsst_out[n, :, :, c] = np.abs(Tx)
+            
+    return fsst_out
     
 __all__ = [
     'get_scores',
@@ -269,5 +292,6 @@ __all__ = [
     'compute_min_max',
     'augment_dataset_softdtw',
     'convert_to_cwt',
-    'convert_to_stransform'
+    'convert_to_stransform',
+    'convert_to_fsst'
 ]
