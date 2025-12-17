@@ -2,7 +2,7 @@
 
 from sklearn.metrics import r2_score, root_mean_squared_error, mean_absolute_error, mean_absolute_percentage_error
 from scipy.signal import resample
-from ssqueezepy import ssq_stft
+from ssqueezepy import ssq_stft, ssq_cwt, cwt
 from torch import sqrt, mean
 
 import numpy as np
@@ -16,7 +16,7 @@ from tslearn.neighbors import KNeighborsTimeSeries
 from tslearn.barycenters import softdtw_barycenter
 from tslearn.metrics import gamma_soft_dtw
 
-import pywt
+
 from stockwell import st
 
 import warnings
@@ -226,24 +226,29 @@ def augment_dataset_softdtw(x, x_proc, y, num_synthetic_ts, max_neighbors=5):
     # return the synthetic set     
     return np.array(synthetic_x), np.array(synthetic_x_proc), np.array(synthetic_y)
 
-def convert_to_cwt(x, n_scales=200, wavelet='morl', description='CWT generation'):
+def convert_to_cwt(x, wavelet='morlet', description='CWT generation', device='cpu'):
     """
     data shape: (N, W, C) - N = Number of samples, W = Width of the sample (time), C = Channel
     returns: CWT numpy array with shape: (N, S, W, C) - S = Scales (height), W = Width
     """   
-    scales = np.arange(1, n_scales+1)#np.logspace(np.log10(1), np.log10(n_scales), n_scales) # 1 … n_scales  (same for both)
-    cwt = np.empty((x.shape[0], n_scales, x.shape[1], x.shape[2]), dtype=x.dtype)
-    for n in tqdm(range(x.shape[0]), desc=description):
-        for c in range(x.shape[2]):
-            coef, _ = pywt.cwt(x[n, :, c], scales, wavelet)
-            # Step 1: Compute magnitude
-            magnitude = np.abs(coef)
-            # Step 2: Scale normalization (1/sqrt(scale))
-            scale_norm = magnitude / np.sqrt(scales[:, np.newaxis])
-            # Step 3: Log transform
-            log_transformed = np.log(scale_norm + 1e-6)
-            cwt[n, :, :, c] = log_transformed
-    return cwt
+    # Set GPU/CPU mode
+    if device == 'gpu':
+        os.environ['SSQ_GPU'] = '1'
+    else:
+        os.environ['SSQ_GPU'] = '0'
+
+    # Run once to get dimensions
+    Wx, _ = cwt(x[0, :, 0], wavelet=wavelet)
+    n_scales_actual = Wx.shape[0]
+    
+    cwt_out = np.empty((x.shape[0], n_scales_actual, x.shape[1], x.shape[2]), dtype=np.float32)
+    
+    for c in tqdm(range(x.shape[2]), desc=description):
+        Wx, _ = cwt(x[:, :, c], wavelet=wavelet)
+        # Log transform for better neural network features
+        cwt_out[:, :, :, c] = np.log(np.abs(Wx) + 1e-6)
+            
+    return cwt_out
     
 def convert_to_stransform(x, lo=0, hi=125, gamma=1, description='S-transform generation'):
     """
@@ -258,26 +263,56 @@ def convert_to_stransform(x, lo=0, hi=125, gamma=1, description='S-transform gen
             cwt[n, :, :, c] = np.abs(stransf)
     return cwt
 
-def convert_to_fsst(x, fs=1.0, description='FSST generation'):
+def convert_to_fsst(x, fs=1.0, description='FSST generation', device='cpu'):
     """
     Apply Fourier Synchrosqueezed Transform (FSST) to signals using ssqueezepy.
     data shape: (N, W, C)
     returns: FSST magnitude array with shape: (N, F, T, C)
     """
+    # Set GPU/CPU mode
+    if device == 'gpu':
+        os.environ['SSQ_GPU'] = '1'
+    else:
+        os.environ['SSQ_GPU'] = '0'
+
     # Run once to get output shape
     # ssq_stft returns tuple, first element is Tx
-    Tx, *_ = ssq_stft(x[0, :, 0])
+    Tx, *_ = ssq_stft(x[0, :, 0], fs=fs)
     F, T = Tx.shape
     
     # Pre-allocate. Note: output might be complex
     fsst_out = np.empty((x.shape[0], F, T, x.shape[2]), dtype=np.float32)
     
-    for n in tqdm(range(x.shape[0]), desc=description):
-        for c in range(x.shape[2]):
-            Tx, *_ = ssq_stft(x[n, :, c])
-            fsst_out[n, :, :, c] = np.abs(Tx)
+    for c in tqdm(range(x.shape[2]), desc=description):
+        Tx, *_ = ssq_stft(x[:, :, c], fs=fs)
+        fsst_out[:, :, :, c] = np.abs(Tx)
             
     return fsst_out
+
+def convert_to_wsst(x, fs=1.0, wavelet='morlet', description='WSST generation', device='cpu'):
+    """
+    Apply Wavelet Synchrosqueezed Transform (WSST) to signals using ssqueezepy.
+    data shape: (N, W, C)
+    returns: WSST magnitude array with shape: (N, F, T, C)
+    """
+    # Set GPU/CPU mode
+    if device == 'gpu':
+        os.environ['SSQ_GPU'] = '1'
+    else:
+        os.environ['SSQ_GPU'] = '0'
+
+    # Run once to get output shape
+    Tx, *_ = ssq_cwt(x[0, :, 0], wavelet=wavelet, fs=fs)
+    F, T = Tx.shape
+    
+    # Pre-allocate
+    wsst_out = np.empty((x.shape[0], F, T, x.shape[2]), dtype=np.float32)
+    
+    for c in tqdm(range(x.shape[2]), desc=description):
+        Tx, *_ = ssq_cwt(x[:, :, c], wavelet=wavelet, fs=fs)
+        wsst_out[:, :, :, c] = np.abs(Tx)
+            
+    return wsst_out
     
 __all__ = [
     'get_scores',
@@ -293,5 +328,6 @@ __all__ = [
     'augment_dataset_softdtw',
     'convert_to_cwt',
     'convert_to_stransform',
-    'convert_to_fsst'
+    'convert_to_fsst',
+    'convert_to_wsst'
 ]
