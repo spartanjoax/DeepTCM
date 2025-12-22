@@ -26,14 +26,14 @@ from keras.utils import plot_model
 from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from keras import saving
 
-from models import create_xception, create_resnet, create_lstm, create_bigru, create_cnn, create_ensemble, root_mse
+from models import create_xception, create_resnet, create_lstm, create_bigru, create_cnn, create_ensemble, create_transformer, root_mse
 
 # Clear all previously registered custom objects
 saving.get_custom_objects().clear()
 
 from helpers import compute_mean_std, compute_min_max, convert_to_cwt, convert_to_stransform, convert_to_fsst, convert_to_wsst, get_scores#, TrainableHighPass, DownSample2
 from data import NASA_Dataset, StdScalerTransform, MinMaxScalerTransform
-from train_vae import train_cvae
+from models.generative import train_generative_model, ConditionalVAE, TimeGAN, TimeGrad
 import os
 
 from keras import backend as K
@@ -60,6 +60,8 @@ es_patience_lstm=50
 es_min_delta=0.0005
 split_type='runs'
 split_ratios = (0.64, 0.16, 0.2) #(0.48, 0.12, 0.4) 
+generative_model_name = 'ConditionalVAE'
+gen_suffix = 'cvae'
 
 data_transform_cwt = [
     'cwt',
@@ -205,13 +207,13 @@ def get_expected_models(test_mode=False, use_big_model=False):
     models.append('CNN')
     
     if not test_mode:
-        models.extend(['LSTM', 'BiGRU'])
+        models.extend(['LSTM', 'BiGRU', 'Transformer'])
         # Ensembles
         models.extend(['Ensemble', 'EnsembleProc'])
         # ResNets
         models.extend(['ResNet', 'RobustResNet'])
         # Proc models (CNN is always in, others if not test_mode)
-        models.extend(['CNNProc', 'LSTMProc', 'BiGRUProc', 'ResNetProc', 'RobustResNetProc'])
+        models.extend(['CNNProc', 'LSTMProc', 'BiGRUProc', 'ResNetProc', 'RobustResNetProc', 'TransformerProc'])
     else:
         # In test mode, only CNN based proc
         models.append('CNNProc')
@@ -247,7 +249,8 @@ def main(epochs=300,
         norm_target=False,
         runs_per_case_test_val=1,
         split_offset=0,
-        use_cvae=False):
+        use_generative=False,
+        extract_features='both'):
     results = []
     
     folder = f'manual_sw{sliding_window_size}_ss{sliding_window_stride}_seed{seed}'
@@ -255,26 +258,39 @@ def main(epochs=300,
         folder += '_targetnorm'
     if runs_per_case_test_val > 0:
         folder += f'_rpc{runs_per_case_test_val}_off{split_offset}'
-    if use_cvae:
-        folder += '_cvae'
+    if use_generative:
+        folder += '_'+gen_suffix
     Path(folder).mkdir(parents=True, exist_ok=True)
     
-    # CVAE Handling
-    cvae_model_file = None
-    cvae_scaler_file = None
-    if use_cvae:
-        output_dir = 'vae_results'
-        cvae_model_file = os.path.join(output_dir, 'cvae_weightsv2.h5')
-        cvae_scaler_file = os.path.join(output_dir, 'vae_scaler_stats.joblib')
+    # Generative Model Handling
+    if use_generative:
+        output_dir = 'generative_results'
+        suffix = f"sw{sliding_window_size}_ss{sliding_window_stride}"
+        gen_model_file = os.path.join(output_dir, f"{generative_model_name}_{suffix}.weights.h5")
+        gen_scaler_file = os.path.join(output_dir, f"{generative_model_name}_scaler_{suffix}.joblib")
         
-        if not os.path.exists(cvae_model_file) or not os.path.exists(cvae_scaler_file):
-            print("================== CVAE Model or Scaler not found. Training CVAE...")
-            train_cvae(sliding_window_size=sliding_window_size, 
-                       sliding_window_stride=sliding_window_stride,
-                       output_dir=output_dir,
-                       epochs=200)
+        if not os.path.exists(gen_model_file) or not os.path.exists(gen_scaler_file):
+            print(f"================== {generative_model_name} Model or Scaler not found. Training...")
+            model_map = {
+                'ConditionalVAE': ConditionalVAE,
+                'TimeGAN': TimeGAN,
+                'TimeGrad': TimeGrad
+            }
+            if generative_model_name not in model_map:
+                raise ValueError(f"Unknown generative model name: {generative_model_name}")
+            
+            model_class = model_map[generative_model_name]
+            
+            # Use a temporary dataset to train the generative model
+            # We use 'all' signal group for a general model
+            training_dataset = NASA_Dataset(split='train', signal_group='all', 
+                                         sliding_window_size=sliding_window_size, 
+                                         sliding_window_stride=sliding_window_stride)
+            
+            train_generative_model(model_class, training_dataset, sliding_window_size, sliding_window_stride, 
+                                   latent_dim=16, epochs=200, output_dir=output_dir)
         else:
-            print("================== CVAE Model found. Using existing weights.")
+            print(f"================== {generative_model_name} Model found. Using existing weights.")
 
     # Check if run is complete
     if check_run_complete(folder, run, data_transform_cwt, test_mode=test_mode, use_big_model=use_big_model) and resume_training:
@@ -328,7 +344,7 @@ def main(epochs=300,
 
     # Compute mean and std for the training data
     train_dataset = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios,sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
-                                    use_cvae=use_cvae, cvae_model_file=cvae_model_file, cvae_scaler_file=cvae_scaler_file)
+                                    use_generative=use_generative, generative_model_name=generative_model_name, extract_features=extract_features!="no")
     mean, std = compute_mean_std(train_dataset)
     
     # Compute min and max for process params (now includes time-domain features)
@@ -349,11 +365,13 @@ def main(epochs=300,
     normalize_transform = StdScalerTransform(mean=mean, std=std)
 
     nasa_train_base = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
-                                    use_cvae=use_cvae, cvae_model_file=cvae_model_file, cvae_scaler_file=cvae_scaler_file)
+                                    use_generative=use_generative, generative_model_name=generative_model_name, extract_features=extract_features!="no")
     logger.info(f"Train runs: {nasa_train_base.train_runs}")
-    nasa_val_base = NASA_Dataset(split='val', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
+    nasa_val_base = NASA_Dataset(split='val', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
+                                    extract_features=extract_features!="no")
     logger.info(f"Val runs: {nasa_train_base.val_runs}", )
-    nasa_test_base = NASA_Dataset(split='test', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset)
+    nasa_test_base = NASA_Dataset(split='test', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
+                                    extract_features=extract_features!="no")
     logger.info(f"Test runs: {nasa_train_base.test_runs}", )
 
     xtr, xtr_proc, ytr = nasa_train_base.data.cpu().data.numpy(), nasa_train_base.proc_data.cpu().data.numpy(), nasa_train_base.targets.cpu().data.numpy()
@@ -465,7 +483,7 @@ def main(epochs=300,
                 'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
                 'data': (xtr, xval, xte), # LSTM uses raw data
                 'patience': es_patience_lstm,
-                'epochs': 1000
+                'epochs': 500
             },
             {
                 'name': 'BiGRU',
@@ -473,13 +491,24 @@ def main(epochs=300,
                 'params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
                 'data': (xtr, xval, xte), # BiGRU uses raw data
                 'patience': es_patience_lstm,
-                'epochs': 1000
+                'epochs': 500
+            },
+            {
+                'name': 'Transformer',
+                'create_fn': create_transformer,
+                'params': {'learning_r': 1e-4, 'decay': 1e-5, 'dropout': 0.1, 'x_shape': xtr.shape, 'num_heads': 4, 'embed_dim': 64, 'num_blocks': 4, 'scalogram_cwt': None},
+                'data': (xtr, xval, xte), # 1D Transformer uses raw data
+                'patience': es_patience,
+                'epochs': 500
             }
         ]
         
-        # Remove Xception if the big model is not used
         if not use_big_model:
             model_configs = model_configs[1:]
+
+        # Filter based on extract_features
+        if extract_features == 'yes':
+            model_configs = [config for config in model_configs if config['name'] in ['CNN', 'LSTM', 'BiGRU']]
 
         if test_mode:
             model_configs = [config for config in model_configs if config['name'] == 'CNN']
@@ -509,75 +538,76 @@ def main(epochs=300,
             )
             trained_models[config['name']] = model
 
-        # Ensemble
         if all(k in trained_models for k in ['LSTM', 'BiGRU', 'CNN']) and not test_mode:
-            index += 1
-            ensemble_input = [xtr, xtr, xtr_cwt]
-            ensemble_val = [xval, xval, xval_cwt]
-            ensemble_test = [xte, xte, xte_cwt]
-            
-            train_model(
-                model_name='Ensemble',
-                create_fn=create_ensemble,
-                train_data=(ensemble_input, ytr),
-                val_data=(ensemble_val, yval),
-                test_data=(ensemble_test, yte),
-                folder=folder,
-                run=run,
-                cwt_transform=cwt_transform,
-                epochs=epochs,
-                resume_training=resume_training,
-                logger=logger,
-                index=index,
-                results=results,
-                cwt_times=(cwt_time_tr, cwt_time_te),
-                model_params={
-                    'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 
-                    'xproc_shape': xtr_proc.shape, 'name': 'Ensemble', 
-                    'hidden_units': [64, 32], 
-                    'model_list': [trained_models['LSTM'], trained_models['BiGRU'], trained_models['CNN']]
-                },
-                patience=es_patience,
-                plot_graph=True,
-                y_min=y_min,
-                y_max=y_max,
-                norm_target=norm_target
-            )
+            if extract_features != 'yes':
+                index += 1
+                ensemble_input = [xtr, xtr, xtr_cwt]
+                ensemble_val = [xval, xval, xval_cwt]
+                ensemble_test = [xte, xte, xte_cwt]
+                
+                train_model(
+                    model_name='Ensemble',
+                    create_fn=create_ensemble,
+                    train_data=(ensemble_input, ytr),
+                    val_data=(ensemble_val, yval),
+                    test_data=(ensemble_test, yte),
+                    folder=folder,
+                    run=run,
+                    cwt_transform=cwt_transform,
+                    epochs=epochs,
+                    resume_training=resume_training,
+                    logger=logger,
+                    index=index,
+                    results=results,
+                    cwt_times=(cwt_time_tr, cwt_time_te),
+                    model_params={
+                        'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 
+                        'xproc_shape': xtr_proc.shape, 'name': 'Ensemble', 
+                        'hidden_units': [64, 32], 
+                        'model_list': [trained_models['LSTM'], trained_models['BiGRU'], trained_models['CNN']]
+                    },
+                    patience=es_patience,
+                    plot_graph=True,
+                    y_min=y_min,
+                    y_max=y_max,
+                    norm_target=norm_target
+                )
 
-            # Ensemble with Process Parameters
-            index += 1
-            ensemble_proc_input = [xtr, xtr, xtr_cwt, xtr_proc]
-            ensemble_proc_val = [xval, xval, xval_cwt, xval_proc]
-            ensemble_proc_test = [xte, xte, xte_cwt, xte_proc]
-            
-            train_model(
-                model_name='EnsembleProc',
-                create_fn=create_ensemble,
-                train_data=(ensemble_proc_input, ytr),
-                val_data=(ensemble_proc_val, yval),
-                test_data=(ensemble_proc_test, yte),
-                folder=folder,
-                run=run,
-                cwt_transform=cwt_transform,
-                epochs=epochs,
-                resume_training=resume_training,
-                logger=logger,
-                index=index,
-                results=results,
-                cwt_times=(cwt_time_tr, cwt_time_te),
-                model_params={
-                    'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 
-                    'xproc_shape': xtr_proc.shape, 'name': 'EnsembleProc', 
-                    'hidden_units': [64, 32], 
-                    'model_list': [trained_models['LSTM'], trained_models['BiGRU'], trained_models['CNN']],
-                    'proc_input': True
-                },
-                patience=es_patience,
-                plot_graph=True,
-                y_min=y_min,
-                y_max=y_max,
-                norm_target=norm_target
-            )
+            if extract_features != 'no':
+                # Ensemble with Process Parameters
+                index += 1
+                ensemble_proc_input = [xtr, xtr, xtr_cwt, xtr_proc]
+                ensemble_proc_val = [xval, xval, xval_cwt, xval_proc]
+                ensemble_proc_test = [xte, xte, xte_cwt, xte_proc]
+                
+                train_model(
+                    model_name='EnsembleProc',
+                    create_fn=create_ensemble,
+                    train_data=(ensemble_proc_input, ytr),
+                    val_data=(ensemble_proc_val, yval),
+                    test_data=(ensemble_proc_test, yte),
+                    folder=folder,
+                    run=run,
+                    cwt_transform=cwt_transform,
+                    epochs=epochs,
+                    resume_training=resume_training,
+                    logger=logger,
+                    index=index,
+                    results=results,
+                    cwt_times=(cwt_time_tr, cwt_time_te),
+                    model_params={
+                        'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 
+                        'xproc_shape': xtr_proc.shape, 'name': 'EnsembleProc', 
+                        'hidden_units': [64, 32], 
+                        'model_list': [trained_models['LSTM'], trained_models['BiGRU'], trained_models['CNN']],
+                        'proc_input': True
+                    },
+                    patience=es_patience,
+                    plot_graph=True,
+                    y_min=y_min,
+                    y_max=y_max,
+                    norm_target=norm_target
+                )
 
         # ResNet Variants
         if test_mode:
@@ -645,7 +675,7 @@ def main(epochs=300,
                 'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
                 'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'LSTMProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
                 'patience': es_patience_lstm,
-                'epochs': 1000
+                'epochs': 500
             },
             {
                 'name': 'BiGRUProc',
@@ -654,7 +684,7 @@ def main(epochs=300,
                 'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr.shape},
                 'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'BiGRUProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
                 'patience': es_patience_lstm,
-                'epochs': 1000
+                'epochs': 500
             },
             {
                 'name': 'ResNetProc',
@@ -671,9 +701,20 @@ def main(epochs=300,
                 'base_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'x_shape': xtr_cwt.shape, 'regress': False, 'attention': True, 'scalogram_cwt': cwt_transform},
                 'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'RobustResNetProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
                 'patience': es_patience
+            },
+            {
+                'name': 'TransformerProc',
+                'base_fn': create_transformer,
+                'input_type': 'raw',
+                'base_params': {'learning_r': 1e-4, 'decay': 1e-5, 'dropout': 0.1, 'x_shape': xtr.shape, 'num_heads': 4, 'embed_dim': 64, 'num_blocks': 4, 'scalogram_cwt': None},
+                'ensemble_params': {'learning_r': 1e-3, 'decay': 1e-5, 'dropout': 0.2, 'xproc_shape': xtr_proc.shape, 'name': 'TransformerProc', 'hidden_units': [64, 32], 'proc_input': True, 'freeze_base': False},
+                'patience': es_patience,
+                'epochs': 500
             }
         ]
-        if test_mode:
+        if extract_features == 'no':
+            proc_configs = [config for config in proc_configs if 'ResNet' in config['name']]
+        elif test_mode:
             proc_configs = [config for config in proc_configs if config['name'] == 'CNNProc']
 
         for config in proc_configs:
@@ -755,7 +796,8 @@ if __name__ == "__main__":
     norm_target=[False]
     runs_per_case_test_val=1
     split_offsets=[2, 5]
-    use_cvae = [False, True]
+    use_generative = [False, True]
+    extract_features='yes'
 
     print('Args received: ', sys.argv[1:])
 
@@ -771,7 +813,7 @@ if __name__ == "__main__":
       elif opt in ("-t"):
         test_mode = True
       elif opt in ("-c"):
-        use_cvae = [arg == "1"]
+        use_generative = [arg == "1"]
 
     if resume_training:
         print(f'================== Resuming training')
@@ -789,12 +831,13 @@ if __name__ == "__main__":
     print(f'================== Training with seed {seed}')
     for nt in norm_target:
         print(f'================== Normalisation for target values: {nt}')
-        for cvae in use_cvae:
-            print(f'================== CVAE: {cvae}')
+        for cvae in use_generative:
+            print(f'================== Generative: {cvae}')
             for offset in split_offsets:
                 print(f'================== Split offset: {offset}')
                 for run_name in ['all','AC_table','AC','DC','DC_table','ACDC']:
                     print(f'================== Training {run_name}')
                     main(epochs=epochs, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
                         run=run_name, resume_training=resume_training, seed=seed, test_mode=test_mode, norm_target=nt,
-                        runs_per_case_test_val=runs_per_case_test_val, split_offset=offset, use_cvae=cvae)
+                        runs_per_case_test_val=runs_per_case_test_val, split_offset=offset, 
+                        use_generative=cvae)

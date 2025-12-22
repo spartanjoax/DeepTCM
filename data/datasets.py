@@ -13,7 +13,7 @@ from helpers import plot_signals, plot_signals_dict, augment_signal, apply_movin
 import data.mat_to_csv as mtc
 
 import torch
-from models.dl_models import create_cvae
+from models.generative import ConditionalVAE, TimeGAN, TimeGrad
 from torch.utils.data import Dataset
 
 allowed_signal_group = ['DC','DC_AE','DC_table','DC_Vib','table','all','AC','AC_AE','AC_table','AC_Vib','internals','ACDC']
@@ -39,10 +39,10 @@ class NASA_Dataset(Dataset):
                  sliding_window_stride=25,
                  runs_per_case_test_val=1,
                  split_offset=0,
-                 use_cvae=False,
-                 cvae_model_file=None,
-                 cvae_scaler_file=None,
-                 cvae_samples_per_combo=200):
+                 use_generative=False,
+                 generative_model_name=None,
+                 gen_samples_per_combo=200,
+                 extract_features=False):
         """
         Custom DataLoader for the NASA-Ames face-milling dataset with train/val/test split support.
 
@@ -91,10 +91,9 @@ class NASA_Dataset(Dataset):
         self.seed = seed
         self.debug_plots = debug_plots
         self.signal_group = signal_group
-        self.use_cvae = use_cvae
-        self.cvae_model_file = cvae_model_file
-        self.cvae_scaler_file = cvae_scaler_file
-        self.cvae_samples_per_combo = cvae_samples_per_combo
+        self.use_generative = use_generative
+        self.generative_model_name = generative_model_name
+        self.gen_samples_per_combo = gen_samples_per_combo
 
         assert split in ['train','val','test'], f'Variable must be one of "train", "val", or "test"'
         assert split_type in ['runs', 'cases'], f'Variable must be one of "runs" or "cases"'
@@ -247,9 +246,11 @@ class NASA_Dataset(Dataset):
         print(f'================== Data augmented')
         print(f'Shapes -> X: {x.shape} - X process params: {x_process_params.shape} - Y: {y.shape}')
 
-        if self.use_cvae and self.cvae_model_file and self.cvae_scaler_file and split == 'train':
-            print('================== CVAE Enabled: Generating synthetic data')
-            x_synth, x_proc_synth, y_synth = self._generate_synthetic_cvae(x, x_process_params, y)
+        if self.use_generative and self.generative_model_name and split == 'train':
+            print(f'================== Generative Model Enabled ({self.generative_model_name}): Generating synthetic data')
+            x_synth, x_proc_synth, y_synth = self._generate_synthetic_data(x, x_process_params, y, 
+                                                                           sliding_window_size=sliding_window_size, 
+                                                                           sliding_window_stride=sliding_window_stride)
              
             # Append synthetic data
             if len(x_synth) > 0:
@@ -266,54 +267,55 @@ class NASA_Dataset(Dataset):
             for i, signal in enumerate(NASA_Dataset.signal_list):
                 print(f'Signal {signal}: Min = {np.min(x_stat[:,:,i])}, Max = {np.max(x_stat[:,:,i])}')
         
-        print('================== Extracting time-domain features')
-        
-        # x is (N, W, C)
-        # We want features (N, C*6)
-        
-        N, W, C = x.shape
-        num_feats = len(NASA_Dataset.TIME_DOMAIN_FEATURES)
-        
-        # Pre-allocate
-        x_features = np.zeros((N, C * num_feats), dtype=np.float32)
-        
-        # Order: For each channel, [mean, var, rms, kurt, skew, ptp]
-        # features for channel i are at indices [i*6 : (i+1)*6]
-        
-        for c_idx in range(C):
-            sig_data = x[:, :, c_idx] # (N, W)
+        if extract_features:
+            print('================== Extracting time-domain features')
             
-            # Mean
-            x_features[:, c_idx * num_feats + 0] = np.mean(sig_data, axis=1)
-            # Variance
-            x_features[:, c_idx * num_feats + 1] = np.var(sig_data, axis=1)
-            # RMS
-            x_features[:, c_idx * num_feats + 2] = np.sqrt(np.mean(sig_data**2, axis=1))
-            # Kurtosis
-            x_features[:, c_idx * num_feats + 3] = np.nan_to_num(kurtosis(sig_data, axis=1))
-            # Skewness
-            x_features[:, c_idx * num_feats + 4] = np.nan_to_num(skew(sig_data, axis=1))
-            # Peak-to-Peak
-            x_features[:, c_idx * num_feats + 5] = np.ptp(sig_data, axis=1)
+            # x is (N, W, C)
+            # We want features (N, C*6)
             
-        # Replace any remaining NaNs (just in case)
-        x_features = np.nan_to_num(x_features)
-
-        # Update proc_variable_list names
-        new_proc_names = []
-        for sig in NASA_Dataset.signal_list:
-            for feat in NASA_Dataset.TIME_DOMAIN_FEATURES:
-                new_proc_names.append(f"{sig}_{feat}")
+            N, W, C = x.shape
+            num_feats = len(NASA_Dataset.TIME_DOMAIN_FEATURES)
+            
+            # Pre-allocate
+            x_features = np.zeros((N, C * num_feats), dtype=np.float32)
+            
+            # Order: For each channel, [mean, var, rms, kurt, skew, ptp]
+            # features for channel i are at indices [i*6 : (i+1)*6]
+            
+            for c_idx in range(C):
+                sig_data = x[:, :, c_idx] # (N, W)
                 
-        # Only update the class variable if it hasn't been updated yet (to avoid duplicates if re-instantiated)
-        # But commonly we want instance-specific, yet the consumer uses the class static list.
-        # Given the legacy design using class variable, we update it carefully or use instance var.
-        # The user requested "update the proc_variable_list".
-        NASA_Dataset.proc_variable_list = NASA_Dataset.BASE_PROC_VAR_LIST + new_proc_names
+                # Mean
+                x_features[:, c_idx * num_feats + 0] = np.mean(sig_data, axis=1)
+                # Variance
+                x_features[:, c_idx * num_feats + 1] = np.var(sig_data, axis=1)
+                # RMS
+                x_features[:, c_idx * num_feats + 2] = np.sqrt(np.mean(sig_data**2, axis=1))
+                # Kurtosis
+                x_features[:, c_idx * num_feats + 3] = np.nan_to_num(kurtosis(sig_data, axis=1))
+                # Skewness
+                x_features[:, c_idx * num_feats + 4] = np.nan_to_num(skew(sig_data, axis=1))
+                # Peak-to-Peak
+                x_features[:, c_idx * num_feats + 5] = np.ptp(sig_data, axis=1)
+                
+            # Replace any remaining NaNs (just in case)
+            x_features = np.nan_to_num(x_features)
 
-        # Concatenate features to process params
-        # x_process_params is (N, 4)
-        x_process_params = np.hstack([x_process_params, x_features])
+            # Update proc_variable_list names
+            new_proc_names = []
+            for sig in NASA_Dataset.signal_list:
+                for feat in NASA_Dataset.TIME_DOMAIN_FEATURES:
+                    new_proc_names.append(f"{sig}_{feat}")
+                    
+            # Only update the class variable if it hasn't been updated yet (to avoid duplicates if re-instantiated)
+            # But commonly we want instance-specific, yet the consumer uses the class static list.
+            # Given the legacy design using class variable, we update it carefully or use instance var.
+            # The user requested "update the proc_variable_list".
+            NASA_Dataset.proc_variable_list = NASA_Dataset.BASE_PROC_VAR_LIST + new_proc_names
+
+            # Concatenate features to process params
+            # x_process_params is (N, 4)
+            x_process_params = np.hstack([x_process_params, x_features])
 
         x, x_process_params = self.remove_signals(x, x_process_params)
 
@@ -540,13 +542,31 @@ class NASA_Dataset(Dataset):
 
         return np.array(x)
 
-    def _generate_synthetic_cvae(self, x, x_process_params, y):
-        # 1. Load Scalers
-        if not os.path.exists(self.cvae_scaler_file):
-             print(f"CVAE Scaler file not found: {self.cvae_scaler_file}")
+    def _generate_synthetic_data(self, x, x_process_params, y, sliding_window_size, sliding_window_stride):
+        # 1. Map model name to class
+        model_map = {
+            'ConditionalVAE': ConditionalVAE,
+            'TimeGAN': TimeGAN,
+            'TimeGrad': TimeGrad
+        }
+        
+        if self.generative_model_name not in model_map:
+            print(f"Unknown generative model: {self.generative_model_name}")
+            return [], [], []
+            
+        model_class = model_map[self.generative_model_name]
+        output_dir = 'generative_results'
+        suffix = f"sw{sliding_window_size}_ss{sliding_window_stride}"
+        
+        model_file = os.path.join(output_dir, f"{self.generative_model_name}_{suffix}.weights.h5")
+        scaler_file = os.path.join(output_dir, f"{self.generative_model_name}_scaler_{suffix}.joblib")
+        
+        # 2. Load Scalers
+        if not os.path.exists(scaler_file):
+             print(f"Generative Scaler file not found: {scaler_file}")
              return [], [], []
              
-        stats = load(self.cvae_scaler_file)
+        stats = load(scaler_file)
         
         sig_mean = stats['signal_mean']
         sig_std = stats['signal_std']
@@ -555,56 +575,40 @@ class NASA_Dataset(Dataset):
         target_min = stats['target_min']
         target_max = stats['target_max']
         
-        # 2. Load Model
-        # Need input dimensions from current data or saved?
-        # x is (N, W, C).
-        # Condition is (4 process + 1 target) = 5
+        # 3. Load Model
         N, W, C = x.shape
-        latent_dim = 16 # Keep consistent with training script
+        latent_dim = 16 
         
-        cvae = create_cvae(input_shape=(W, C), label_dim=5, latent_dim=latent_dim,
-                           filters=[32, 64, 128], kernel_size=[3, 3, 3], strides=[2, 2, 2])
-        
-        if os.path.exists(self.cvae_model_file):
-            # Dummy call to initialize variables for subclassed model
-            _dummy_x = np.zeros((1, W, C), dtype=np.float32)
-            # Label dim is 5. But model expects specific inputs.
-            # Wrapper CVAE might take (x, y) in call?? No, create_cvae returns CVAE instance.
-            # CVAE class in dl_models uses call(inputs). inputs=[x, y].
-            # Let's check dl_models CVAE.call signature if possible, but standard is inputs.
-            # Actually, CVAE.call(inputs) where inputs=[x, condition].
-            _dummy_cond = np.zeros((1, 5), dtype=np.float32)
-            cvae([_dummy_x, _dummy_cond])
-            
-            cvae.load_weights(self.cvae_model_file)
+        # Condition dim is 5 (4 proc + 1 target)
+        if self.generative_model_name == 'ConditionalVAE':
+            model = model_class(input_shape=(W, C), cond_dim=5, latent_dim=latent_dim)
         else:
-             print(f"CVAE Model file not found: {self.cvae_model_file}")
+            model = model_class(seq_len=W, n_features=C, cond_dim=5, latent_dim=latent_dim)
+            
+        if os.path.exists(model_file):
+            # Dummy call to build model
+            _dummy_x = np.zeros((1, W, C), dtype=np.float32)
+            _dummy_cond = np.zeros((1, 5), dtype=np.float32)
+            model([_dummy_x, _dummy_cond])
+            model.load_weights(model_file)
+        else:
+             print(f"Generative Model file not found: {model_file}")
              return [], [], []
              
-        decoder = cvae.decoder
+        # 4. Identify unique process parameter combinations
+        base_params = x_process_params[:, :4] 
+        unique_proc_combos = np.unique(base_params, axis=0)
         
-        # 3. Identify unique process parameter combinations
-        # x_process_params contains Features too. Base params are first 4 (NASA_Dataset.BASE_PROC_VAR_LIST)
-        base_params = x_process_params[:, :4] # (N, 4)
-        unique_proc_combos = np.unique(base_params, axis=0) # (K, 4)
-        
-        print(f"CVAE: Found {len(unique_proc_combos)} unique process parameter combinations.")
+        print(f"Generative: Found {len(unique_proc_combos)} unique process parameter combinations.")
         
         x_synth_list = []
         y_synth_list = []
-        x_proc_synth_list = [] # Base params first
+        x_proc_synth_list = []
         
-        # 4. Generate
+        # 5. Generate
         for combo in unique_proc_combos:
-             # combo is [DOC, feed, mat, Vc]
-             
-             # Generate random targets for this combo
-             # Uniform 0 to 0.4
-             targets = np.random.uniform(0, 0.4, size=(self.cvae_samples_per_combo, 1))
-             
-             # Prepare condition vector (normalized)
-             # Repeat combo for all samples
-             combo_repeated = np.tile(combo, (self.cvae_samples_per_combo, 1))
+             targets = np.random.uniform(0, 0.4, size=(self.gen_samples_per_combo, 1))
+             combo_repeated = np.tile(combo, (self.gen_samples_per_combo, 1))
              
              # Normalize combo
              proc_range = proc_max - proc_min
@@ -616,28 +620,36 @@ class NASA_Dataset(Dataset):
              target_range[target_range == 0] = 1.0
              target_norm = (targets - target_min) / target_range
              
-             # Concat
              condition = np.hstack([combo_norm, target_norm])
              
-             # Sample Z
-             z_sample = np.random.normal(size=(self.cvae_samples_per_combo, latent_dim))
+             # Generate
+             if self.generative_model_name == 'ConditionalVAE':
+                 z_sample = np.random.normal(size=(self.gen_samples_per_combo, latent_dim))
+                 x_gen_norm = model.decoder.predict([z_sample, condition], verbose=0)
+             elif hasattr(model, 'generate'):
+                 x_gen_norm = model.generate(condition, self.gen_samples_per_combo)
+             else:
+                 # Fallback for models that might not have a dedicated generate method yet
+                 print(f"Model {self.generative_model_name} does not have a generate method.")
+                 continue
              
-             # Decode
-             x_gen_norm = decoder.predict([z_sample, condition], verbose=0)
-             
+             # Convert to numpy if it's a tensor
+             if hasattr(x_gen_norm, 'numpy'):
+                 x_gen_norm = x_gen_norm.numpy()
+                 
              # Denormalize Signal
              x_gen = x_gen_norm * (sig_std + 1e-8) + sig_mean
              
              x_synth_list.append(x_gen)
-             y_synth_list.append(targets.flatten()) # flatten to 1D
+             y_synth_list.append(targets.flatten())
              x_proc_synth_list.append(combo_repeated)
 
         if len(x_synth_list) == 0:
              return [], [], []
              
-        x_synth = np.vstack(x_synth_list) # (Total_Synth, W, C)
-        y_synth = np.concatenate(y_synth_list) # (Total_Synth,)
-        x_proc_synth = np.vstack(x_proc_synth_list) # (Total_Synth, 4)
+        x_synth = np.vstack(x_synth_list)
+        y_synth = np.concatenate(y_synth_list)
+        x_proc_synth = np.vstack(x_proc_synth_list)
         
         return x_synth, x_proc_synth, y_synth
 
