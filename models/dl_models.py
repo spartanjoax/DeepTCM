@@ -1,4 +1,4 @@
-import tensorflow as tf
+import keras.ops as ops
 from keras.models import Model
 from keras.layers import Input, LSTM, Dense, Conv2D, Conv1D, AveragePooling2D, AveragePooling1D, Flatten, Bidirectional, GRU, concatenate, Dropout, BatchNormalization, Activation, Add, Multiply, GlobalAveragePooling1D, GlobalAveragePooling2D, Lambda, Resizing, LayerNormalization, Reshape, Conv1DTranspose, Concatenate, UpSampling1D
 from keras.optimizers import Adam
@@ -10,7 +10,7 @@ from keras.layers import MultiHeadAttention, Embedding, Layer
 #from keras import ops
 
 def root_mse(y_test, y_pred):
-    return K.sqrt(K.mean(K.square(y_pred - y_test)))
+    return ops.sqrt(ops.mean(ops.square(y_pred - y_test)))
 
 def conv_bn_relu(x, filters, kernel_size, padding='valid', name='', line=0, decay=1e-5, signal_qty=1, is_2d=False, grouping=False):
     if not is_2d:
@@ -62,7 +62,7 @@ def create_xception(learning_r=1e-3,
     resnet = Xception(include_top=False, pooling='avg', input_shape=(height, width, 3))
     
     if not is_2d:
-        x = Lambda(lambda x: tf.expand_dims(x, axis=1))(signal_input_resnet)  # Add height dimension
+        x = Lambda(lambda x: ops.expand_dims(x, axis=1))(signal_input_resnet)  # Add height dimension
 
     x = Conv2D(filters=3, kernel_size=1, padding='same', strides=1, name=name+'_ConvResize')(x if not is_2d else signal_input_resnet)
     print("Change to 3 channels:",x.shape)
@@ -159,7 +159,7 @@ def create_lstm(learning_r=1e-3,
             x = Bidirectional(LSTM(hidden_units[i], return_sequences=True, kernel_regularizer=l2(decay)), name=name+f'_{i+1}')(x)
         x = LayerNormalization(name=name+f'_BN_{i+1}')(x)
 
-    x = Lambda(lambda x: tf.expand_dims(x, axis=1))(x)  # Add height dimension
+    x = Lambda(lambda x: ops.expand_dims(x, axis=1))(x)  # Add height dimension
     x = GlobalAveragePooling1D(name=name+'_gap')(x)
         
     x = Dense(128, activation='relu', name=name+'_dense1')(x)
@@ -189,7 +189,7 @@ def create_bigru(learning_r=1e-3,
             x = Bidirectional(GRU(hidden_units[i], return_sequences=True, kernel_regularizer=l2(decay)), name=name+f'_{i+1}')(x)
         x = LayerNormalization(name=name+f'_LN_{i+1}')(x)
         
-    x = Lambda(lambda x: tf.expand_dims(x, axis=1))(x)  # Add height dimension
+    x = Lambda(lambda x: ops.expand_dims(x, axis=1))(x)  # Add height dimension
     x = GlobalAveragePooling1D(name=name+'_gap')(x)
         
     x = Dense(128, activation='relu', name=name+'_dense1')(x)
@@ -312,17 +312,22 @@ class Patches(Layer):
         self.patch_size = patch_size
 
     def call(self, images):
-        batch_size = tf.shape(images)[0]
-        # Images are (B, H, W, C)
-        patches = tf.image.extract_patches(
-            images=images,
-            sizes=[1, self.patch_size, self.patch_size, 1],
-            strides=[1, self.patch_size, self.patch_size, 1],
-            rates=[1, 1, 1, 1],
-            padding="VALID",
+        input_shape = ops.shape(images)
+        batch_size = input_shape[0]
+        height = input_shape[1]
+        width = input_shape[2]
+        channels = input_shape[3]
+        num_patches_h = height // self.patch_size
+        num_patches_w = width // self.patch_size
+        patches = ops.image.extract_patches(images, size=self.patch_size)
+        patches = ops.reshape(
+            patches,
+            (
+                batch_size,
+                num_patches_h * num_patches_w,
+                self.patch_size * self.patch_size * channels,
+            ),
         )
-        patch_dims = patches.shape[-1]
-        patches = tf.reshape(patches, [batch_size, -1, patch_dims])
         return patches
     
     def get_config(self):
@@ -340,7 +345,8 @@ class PatchEncoder(Layer):
         )
 
     def call(self, patch):
-        positions = tf.range(start=0, limit=self.num_patches, delta=1)
+        positions = ops.arange(start=0, stop=self.num_patches, step=1)
+        positions = ops.expand_dims(positions, axis=0)
         encoded = self.projection(patch) + self.position_embedding(positions)
         return encoded
 
@@ -349,22 +355,57 @@ class PatchEncoder(Layer):
         config.update({"num_patches": self.num_patches, "projection_dim": self.projection.units})
         return config
 
-def transformer_blocks(x, num_blocks, embed_dim, num_heads, dense_dim, dropout=0.1, name='transformer'):
+def vit_transformer_block(x, num_blocks, embed_dim, num_heads, dense_dim, dropout=0.1, name='vit_trans'):
     for i in range(num_blocks):
-        # LayerNorm + Attention
+        # LayerNorm 1
         x1 = LayerNormalization(epsilon=1e-6, name=f"{name}_ln_1_{i}")(x)
+        # MultiHeadAttention
         attention_output = MultiHeadAttention(
             num_heads=num_heads, key_dim=embed_dim, dropout=dropout, name=f"{name}_mha_{i}"
         )(x1, x1)
+        # Skip 1
         x2 = Add(name=f"{name}_add_1_{i}")([attention_output, x])
         
-        # LayerNorm + MLP
+        # LayerNorm 2
         x3 = LayerNormalization(epsilon=1e-6, name=f"{name}_ln_2_{i}")(x2)
-        x3 = Dense(dense_dim, activation=tf.nn.gelu, name=f"{name}_dense_1_{i}")(x3)
-        x3 = Dropout(dropout, name=f"{name}_drop_1_{i}")(x3)
-        x3 = Dense(embed_dim, name=f"{name}_dense_2_{i}")(x3)
-        x3 = Dropout(dropout, name=f"{name}_drop_2_{i}")(x3)
+        # MLP
+        x3 = Dense(dense_dim, activation="gelu", name=f"{name}_mlp_1_{i}")(x3)
+        x3 = Dropout(dropout, name=f"{name}_drop_mlp_1_{i}")(x3)
+        x3 = Dense(embed_dim, name=f"{name}_mlp_2_{i}")(x3)
+        x3 = Dropout(dropout, name=f"{name}_drop_mlp_2_{i}")(x3)
+        # Skip 2
         x = Add(name=f"{name}_add_2_{i}")([x3, x2])
+    return x
+
+def ts_transformer_block(x, num_blocks, head_size, num_heads, ff_dim, dropout=0, name='ts_trans'):
+    for i in range(num_blocks):
+        # Attention + Norm (Post-Norm style as per example)
+        # The example: MHA -> Dropout -> LN -> Add(x) ?
+        # Actually exact Keras example:
+        # x = MHA(inputs, inputs)
+        # x = Dropout(x)
+        # x = LN(x)
+        # res = x + inputs
+        
+        # Note: Keras example uses 'inputs' as variable, here 'x' is inputs to block.
+        inputs = x
+        x_att = MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout, name=f"{name}_mha_{i}")(inputs, inputs)
+        x_att = Dropout(dropout, name=f"{name}_drop_att_{i}")(x_att)
+        x_att = LayerNormalization(epsilon=1e-6, name=f"{name}_ln_1_{i}")(x_att)
+        res = Add(name=f"{name}_add_1_{i}")([x_att, inputs])
+        
+        # Feed Forward
+        # x = Conv1D(filters=ff_dim, kernel_size=1, activation="relu")(res)
+        # x = Dropout(x)
+        # x = Conv1D(filters=inputs.shape[-1], kernel_size=1)(x)
+        # x = LN(x)
+        # return x + res
+        
+        x_ff = Conv1D(filters=ff_dim, kernel_size=1, activation="relu", name=f"{name}_ff_conv1_{i}")(res)
+        x_ff = Dropout(dropout, name=f"{name}_drop_ff_{i}")(x_ff)
+        x_ff = Conv1D(filters=inputs.shape[-1], kernel_size=1, name=f"{name}_ff_conv2_{i}")(x_ff)
+        x_ff = LayerNormalization(epsilon=1e-6, name=f"{name}_ln_2_{i}")(x_ff)
+        x = Add(name=f"{name}_add_2_{i}")([x_ff, res])
     return x
 
 def create_transformer(learning_r=1e-3,
@@ -384,42 +425,42 @@ def create_transformer(learning_r=1e-3,
     if is_2d:
         # Vision Transformer Logic
         # x_shape is (Batch, H, W, C)
-        # Check if dimensions allow patching
-        # Assuming H and W are > patch_size. Padding might be needed if not divisible but we assume valid for now or rely on extract_patches valid padding
         
         patches = Patches(patch_size)(signal_input)
         # patches shape: (B, num_patches, patch_dims)
-        num_patches = (x_shape[1] // patch_size) * (x_shape[2] // patch_size)
         
+        # Calculate num_patches
+        height = x_shape[1]
+        width = x_shape[2]
+        num_patches = (height // patch_size) * (width // patch_size)
+        
+        # Encode patches
         encoded_patches = PatchEncoder(num_patches, embed_dim)(patches)
-        x = encoded_patches
+        
+        # ViT Blocks
+        x = vit_transformer_block(encoded_patches, num_blocks, embed_dim, num_heads, dense_dim=embed_dim*2, dropout=dropout, name=name)
+        
+        # Output Head (ViT style: LN -> Flatten -> Dropout -> Dense -> Dropout -> Dense)
+        x = LayerNormalization(epsilon=1e-6, name=name+'_ln_out')(x)
+        x = Flatten(name=name+'_flatten')(x)
+        x = Dropout(0.5, name=name+'_drop_out')(x)
+        x = Dense(64, activation='relu', name=name+'_mlp_1')(x)
+        x = Dropout(0.5)(x)
+        x = Dense(1, activation='linear', name=name+'_output')(x)
+
     else:
-        # 1D Transformer Logic
-        # x_shape is (Batch, Len, Chan)
-        # Just project to embed_dim or use directly
+        # Time-Series Transformer Logic
+        # Input: (Batch, SeqLen, Feat) directly to blocks
+        x = signal_input
+        # TS Blocks
+        x = ts_transformer_block(x, num_blocks, head_size=embed_dim, num_heads=num_heads, ff_dim=4, dropout=dropout, name=name)
         
-        # We can treat each time step as a token, but length 250 is fine.
-        # Project to embed_dim
-        x = Dense(embed_dim, name=name+'_projection')(signal_input)
-        
-        # Add positional embedding
-        seq_len = x_shape[1]
-        # Use PatchEncoder logic for positional embedding but without the patch projection part, or just reuse it:
-        # We can implement a simple PositionEmbedding layer or reuse PatchEncoder if we consider 1D "patches" of size 1
-        
-        positions = tf.range(start=0, limit=seq_len, delta=1)
-        position_embedding = Embedding(input_dim=seq_len, output_dim=embed_dim)(positions)
-        x = x + position_embedding
-
-    # Transformer Blocks
-    x = transformer_blocks(x, num_blocks, embed_dim, num_heads, dense_dim=embed_dim*2, dropout=dropout, name=name)
-
-    # Output Head
-    x = GlobalAveragePooling1D(name=name+'_gap')(x)
-    x = Dropout(dropout)(x)
-    x = Dense(64, activation='relu', name=name+'_mlp_1')(x)
-    x = Dropout(dropout)(x)
-    x = Dense(1, activation='linear', name=name+'_output')(x)
+        # Output Head (TS style: GAP -> Dense -> Dropout -> Dense(softmax/linear))
+        # Note: Example uses GlobalAveragePooling1D(data_format="channels_last")
+        x = GlobalAveragePooling1D(data_format="channels_last", name=name+'_gap')(x)
+        x = Dense(64, activation='relu', name=name+'_mlp_1')(x)
+        x = Dropout(dropout)(x)
+        x = Dense(1, activation='linear', name=name+'_output')(x)
 
     model = Model(inputs=signal_input, outputs=x, name=name)
     model.compile(loss=Huber(delta=0.5), optimizer=Adam(learning_rate=learning_r, clipnorm=1.0), metrics=[root_mse])

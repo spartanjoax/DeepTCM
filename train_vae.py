@@ -1,7 +1,6 @@
 
 import os
 import numpy as np
-import tensorflow as tf
 from keras.callbacks import EarlyStopping
 from data.datasets import NASA_Dataset
 from models.generative import ConditionalVAE, train_generative_model

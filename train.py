@@ -8,10 +8,10 @@ import glob
 import gc
 
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1' 
-#os.environ["KERAS_BACKEND"] = "tensorflow" #Available backend options are: "jax", "tensorflow", "torch"
-import tensorflow as tf
-tf.compat.v1.enable_eager_execution()
+#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1' 
+os.environ["KERAS_BACKEND"] = "torch" #Available backend options are: "jax", "tensorflow", "torch"
+#import tensorflow as tf
+#tf.compat.v1.enable_eager_execution()
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -77,7 +77,7 @@ class NumpyFloatValuesEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 def get_scores(y_test, y_pred):
-    rmse = float(tf.squeeze(root_mse(y_test, y_pred)).numpy())
+    rmse = float(np.squeeze(root_mse(y_test, y_pred)))
     r2 = r2_score(y_test, y_pred)
     mae = mean_absolute_error(y_test, y_pred)
     mape = mean_absolute_percentage_error(y_test, y_pred)
