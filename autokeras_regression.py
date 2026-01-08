@@ -293,7 +293,7 @@ if __name__ == "__main__":
     print('Press any key to begin')
     inp = input()
 
-    for run_name in ['_ACDC','_all']:#['_AC','_AC_AE','_AC_Vib','_AC_table','_table']:
+    for run_name in ['_all']:#['_AC','_AC_AE','_AC_Vib','_AC_table','_ACDC']:
         num_trials = 50# if run_name == '_AC' else 40
         for block_type in ['rnn_gru','rnn','cnn']:
             print(f'================== Training {run_name} - {block_type}')

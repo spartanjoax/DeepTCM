@@ -22,7 +22,7 @@ from joblib import dump
 from pathlib import Path
 
 from keras.models import load_model
-from keras.utils import plot_model
+from keras.utils import plot_model, clear_session
 from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from keras import saving
 
@@ -31,12 +31,11 @@ from models import create_xception, create_resnet, create_lstm, create_bigru, cr
 # Clear all previously registered custom objects
 saving.get_custom_objects().clear()
 
-from helpers import compute_mean_std, compute_min_max, convert_to_cwt, convert_to_stransform, convert_to_fsst, convert_to_wsst, get_scores#, TrainableHighPass, DownSample2
+from helpers import compute_mean_std, compute_min_max, convert_to_cwt, convert_to_stransform, convert_to_fsst, convert_to_wsst#, TrainableHighPass, DownSample2
+from helpers import evaluate_model, NumpyFloatValuesEncoder
 from data import NASA_Dataset, StdScalerTransform, MinMaxScalerTransform
-from models.generative import train_generative_model, ConditionalVAE, TimeGAN, TimeGrad
+from models.generative import train_generative_model
 import os
-
-from keras import backend as K
 
 import json
 import time
@@ -69,56 +68,6 @@ data_transform_cwt = [
     'wsst',
     None
 ]
-
-class NumpyFloatValuesEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.float32):
-            return float(obj)
-        return json.JSONEncoder.default(self, obj)
-
-def get_scores(y_test, y_pred):
-    rmse = float(np.squeeze(root_mse(y_test, y_pred)))
-    r2 = r2_score(y_test, y_pred)
-    mae = mean_absolute_error(y_test, y_pred)
-    mape = mean_absolute_percentage_error(y_test, y_pred)
-    return rmse, r2, mae, mape
-
-def evaluate_save_model(model, model_name, index, x_test, y_test, 
-                        run_name, results, model_results, folder=None, 
-                        y_min=0, y_max=1, norm_target=False):
-    # Evaluate the model on the test set
-    start_time = time.time()
-    ypred = model.predict(x_test)
-    total_time = time.time() - start_time
-    model_results['eval_time'] = total_time
-    
-    # Inverse MinMax predictions and targets
-    if norm_target:
-        ypred_orig = ypred * (y_max - y_min) + y_min
-        y_test_orig = y_test * (y_max - y_min) + y_min
-    else:
-        ypred_orig = ypred
-        y_test_orig = y_test
-    
-    rmse, r2, mae, mape = get_scores(y_test_orig, ypred_orig)
-    print(f'RMSE: {rmse:.5f}\nR2: {r2:.5f}\nMAE: {mae:.5f}\nMAPE: {mape:.5f}')
-    
-    file_name = f'{folder + "/" if folder is not None else ""}DL_{model_name}_{run_name}_{rmse:.4f}.h5'
-
-    model_results['model_file'] = file_name
-    model_results['r2_score'] = r2
-    model_results['rmse'] = rmse
-    results.append(model_results)
-
-    model.save(file_name)
-
-    results_df = pd.DataFrame({'Ground truth' : np.squeeze(y_test_orig), 'Prediction' : np.squeeze(ypred_orig)},columns=['Ground truth', 'Prediction']).sort_values(by=['Ground truth'], ignore_index=True)
-
-    plt.plot(results_df['Prediction'], label='Prediction')
-    plt.plot(results_df['Ground truth'], label='Ground truth')
-    plt.legend(loc='upper left')
-    plt.savefig(f"{folder + '/' if folder is not None else ''}/DL_{model_name}_{run_name}_test_pred.png")
-    plt.clf()
 
 def train_model(model_name, create_fn, train_data, val_data, test_data, 
                 folder, run, cwt_transform, epochs, resume_training, 
@@ -185,7 +134,20 @@ def train_model(model_name, create_fn, train_data, val_data, test_data,
         model_results['time'] = total_time
         model_results['history'] = history.history
         
-    evaluate_save_model(model, model_name, index, xte, yte, f'{run}_{cwt_transform}', results, model_results, folder=folder, y_min=y_min, y_max=y_max, norm_target=norm_target)
+    evaluate_model(
+        model=model, 
+        x=xte,
+        y=yte,
+        folder=folder,
+        run_name=f'{model_name}_{run}_{cwt_transform}',
+        model_results=model_results, # Passed as reference
+        y_min=y_min,
+        y_max=y_max,
+        norm_target=norm_target
+    )
+    # Append to results list manually since helper doesn't do it
+    results.append(model_results)
+
     with open(f'{folder}/DL_{model_name}_{run}_{cwt_transform}.json', "w") as outfile:
         outfile.write(json.dumps(model_results, indent=4, cls=NumpyFloatValuesEncoder))
         
@@ -250,7 +212,9 @@ def main(epochs=300,
         runs_per_case_test_val=1,
         split_offset=0,
         use_generative=False,
-        extract_features='both'):
+        extract_features='both',
+        ma_window_size=10,
+        gen_norm_type='minmax'):
     results = []
     
     folder = f'manual_sw{sliding_window_size}_ss{sliding_window_stride}_seed{seed}'
@@ -271,24 +235,23 @@ def main(epochs=300,
         
         if not os.path.exists(gen_model_file) or not os.path.exists(gen_scaler_file):
             print(f"================== {generative_model_name} Model or Scaler not found. Training...")
-            model_map = {
-                'ConditionalVAE': ConditionalVAE,
-                'TimeGAN': TimeGAN,
-                'TimeGrad': TimeGrad
-            }
-            if generative_model_name not in model_map:
-                raise ValueError(f"Unknown generative model name: {generative_model_name}")
             
-            model_class = model_map[generative_model_name]
+            allowed_gen_models = ['ConditionalVAE', 'TimeGAN']
+            if generative_model_name not in allowed_gen_models:
+                raise ValueError(f"Unknown generative model name: {generative_model_name}")
             
             # Use a temporary dataset to train the generative model
             # We use 'all' signal group for a general model
             training_dataset = NASA_Dataset(split='train', signal_group='all', 
                                          sliding_window_size=sliding_window_size, 
-                                         sliding_window_stride=sliding_window_stride)
+                                         sliding_window_stride=sliding_window_stride, 
+                                         seed=seed,split_type=split_type, 
+                                         runs_per_case_test_val=runs_per_case_test_val, 
+                                         split_offset=split_offset,
+                                         avg_window_size=ma_window_size)
             
-            train_generative_model(model_class, training_dataset, sliding_window_size, sliding_window_stride, 
-                                   latent_dim=16, epochs=200, output_dir=output_dir)
+            train_generative_model(generative_model_name, training_dataset, sliding_window_size, sliding_window_stride, 
+                                   latent_dim=16, epochs=200, output_dir=output_dir, normalization_type=gen_norm_type)
         else:
             print(f"================== {generative_model_name} Model found. Using existing weights.")
 
@@ -344,7 +307,7 @@ def main(epochs=300,
 
     # Compute mean and std for the training data
     train_dataset = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios,sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
-                                    use_generative=use_generative, generative_model_name=generative_model_name, extract_features=extract_features!="no")
+                                    use_generative=use_generative, generative_model_name=generative_model_name, extract_features=extract_features!="no", avg_window_size=ma_window_size)
     mean, std = compute_mean_std(train_dataset)
     
     # Compute min and max for process params (now includes time-domain features)
@@ -365,13 +328,13 @@ def main(epochs=300,
     normalize_transform = StdScalerTransform(mean=mean, std=std)
 
     nasa_train_base = NASA_Dataset(split='train', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
-                                    use_generative=use_generative, generative_model_name=generative_model_name, extract_features=extract_features!="no")
+                                    use_generative=use_generative, generative_model_name=generative_model_name, extract_features=extract_features!="no", avg_window_size=ma_window_size)
     logger.info(f"Train runs: {nasa_train_base.train_runs}")
     nasa_val_base = NASA_Dataset(split='val', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
-                                    extract_features=extract_features!="no")
+                                    extract_features=extract_features!="no", avg_window_size=ma_window_size)
     logger.info(f"Val runs: {nasa_train_base.val_runs}", )
     nasa_test_base = NASA_Dataset(split='test', signal_group=run, split_ratios=split_ratios, transformX=normalize_transform, transformProc=minmax_transform, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset,
-                                    extract_features=extract_features!="no")
+                                    extract_features=extract_features!="no", avg_window_size=ma_window_size)
     logger.info(f"Test runs: {nasa_train_base.test_runs}", )
 
     xtr, xtr_proc, ytr = nasa_train_base.data.cpu().data.numpy(), nasa_train_base.proc_data.cpu().data.numpy(), nasa_train_base.targets.cpu().data.numpy()
@@ -783,7 +746,7 @@ def main(epochs=300,
     except:
         pass
     
-    K.clear_session()
+    clear_session()
     gc.collect()
 
 if __name__ == "__main__":
@@ -798,10 +761,12 @@ if __name__ == "__main__":
     split_offsets=[2, 5]
     use_generative = [False, True]
     extract_features='yes'
+    ma_window_size=10
+    gen_norm_type='minmax'
 
     print('Args received: ', sys.argv[1:])
 
-    opts, args = getopt.getopt(sys.argv[1:],"he:p:c:r:t")
+    opts, args = getopt.getopt(sys.argv[1:],"he:p:c:r:tw:")
     for opt, arg in opts:
       if opt == '-h':
         print ('DL_manual_regression.py\n\t-a <apply_averaging (1 or 0)>\n\t-e <epochs>\n\t-w <average_window_size>\n\t-p <preload_model_file>\n\t-r <resume_training (1 or 0)>\n\t-t <test_mode>')
@@ -814,6 +779,8 @@ if __name__ == "__main__":
         test_mode = True
       elif opt in ("-c"):
         use_generative = [arg == "1"]
+      elif opt in ("-w"):
+        ma_window_size = int(arg)
 
     if resume_training:
         print(f'================== Resuming training')
@@ -840,4 +807,4 @@ if __name__ == "__main__":
                     main(epochs=epochs, sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
                         run=run_name, resume_training=resume_training, seed=seed, test_mode=test_mode, norm_target=nt,
                         runs_per_case_test_val=runs_per_case_test_val, split_offset=offset, 
-                        use_generative=cvae)
+                        use_generative=cvae, ma_window_size=ma_window_size, gen_norm_type=gen_norm_type)

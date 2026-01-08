@@ -13,8 +13,10 @@ from helpers import plot_signals, plot_signals_dict, augment_signal, apply_movin
 import data.mat_to_csv as mtc
 
 import torch
-from models.generative import ConditionalVAE, TimeGAN, TimeGrad
+import tsgm
 from torch.utils.data import Dataset
+
+
 
 allowed_signal_group = ['DC','DC_AE','DC_table','DC_Vib','table','all','AC','AC_AE','AC_table','AC_Vib','internals','ACDC']
     
@@ -42,7 +44,9 @@ class NASA_Dataset(Dataset):
                  use_generative=False,
                  generative_model_name=None,
                  gen_samples_per_combo=200,
-                 extract_features=False):
+                 extract_features=False,
+                 apply_averaging=True,
+                 avg_window_size=10):
         """
         Custom DataLoader for the NASA-Ames face-milling dataset with train/val/test split support.
 
@@ -94,16 +98,17 @@ class NASA_Dataset(Dataset):
         self.use_generative = use_generative
         self.generative_model_name = generative_model_name
         self.gen_samples_per_combo = gen_samples_per_combo
+        self.avg_window_size = avg_window_size
 
         assert split in ['train','val','test'], f'Variable must be one of "train", "val", or "test"'
         assert split_type in ['runs', 'cases'], f'Variable must be one of "runs" or "cases"'
         assert signal_group in allowed_signal_group, f'Variable must be one of {allowed_signal_group}'
 
-        data_file_name = f'data/nasa_{sliding_window_size}_{sliding_window_stride}.bin'
+        data_file_name = f'data/nasa_{sliding_window_size}_{sliding_window_stride}{f"_ma{avg_window_size}" if apply_averaging else ""}.bin'
 
         if not os.path.exists(data_file_name):
             print('================== NASA dataset files do not exist\nProcessing and saving splits')
-            self._process_dataset(sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride, data_file_name=data_file_name,apply_averaging=True)
+            self._process_dataset(data_file_name=data_file_name,apply_averaging=apply_averaging, avg_window_size=avg_window_size)
         else:
             print('================== NASA dataset files exist\nLoading pre-saved splits')
 
@@ -350,9 +355,7 @@ class NASA_Dataset(Dataset):
 
     def _process_dataset(self,
                         apply_averaging = True,
-                        avg_window_size=20, 
-                        sliding_window_size=250,
-                        sliding_window_stride=25,
+                        avg_window_size=10, 
                         data_file_name='nasa.bin'):
         """
         Processes the dataset CSV file. If the expanded CSV file has not been created,
@@ -543,11 +546,10 @@ class NASA_Dataset(Dataset):
         return np.array(x)
 
     def _generate_synthetic_data(self, x, x_process_params, y, sliding_window_size, sliding_window_stride):
-        # 1. Map model name to class
+        # 1. Map model name to tsgm class
         model_map = {
-            'ConditionalVAE': ConditionalVAE,
-            'TimeGAN': TimeGAN,
-            'TimeGrad': TimeGrad
+            'ConditionalVAE': tsgm.models.cBetaVAE,
+            'TimeGAN': tsgm.models.timeGAN.TimeGAN
         }
         
         if self.generative_model_name not in model_map:
@@ -579,17 +581,29 @@ class NASA_Dataset(Dataset):
         N, W, C = x.shape
         latent_dim = 16 
         
-        # Condition dim is 5 (4 proc + 1 target)
+        
+        # Build model with tsgm zoo architectures
         if self.generative_model_name == 'ConditionalVAE':
-            model = model_class(input_shape=(W, C), cond_dim=5, latent_dim=latent_dim)
+            architecture = tsgm.models.architectures.zoo["cvae_conv5"](
+                seq_len=W, feat_dim=C, latent_dim=latent_dim, output_dim=5
+            )
+            model = tsgm.models.cvae.cBetaVAE(
+                encoder=architecture.encoder, decoder=architecture.decoder, 
+                latent_dim=latent_dim, temporal=False, beta=0.5
+            )
+        elif self.generative_model_name == 'TimeGAN':
+            architecture = tsgm.models.architectures.zoo["cgan_lstm_3"](
+                seq_len=W, feat_dim=C, latent_dim=24, output_dim=5
+            )
+            model = tsgm.models.cgan.ConditionalGAN(
+                discriminator=architecture.discriminator, generator=architecture.generator,
+                latent_dim=24, temporal=False
+            )
         else:
-            model = model_class(seq_len=W, n_features=C, cond_dim=5, latent_dim=latent_dim)
+            print(f"Unknown model: {self.generative_model_name}")
+            return [], [], []
             
         if os.path.exists(model_file):
-            # Dummy call to build model
-            _dummy_x = np.zeros((1, W, C), dtype=np.float32)
-            _dummy_cond = np.zeros((1, 5), dtype=np.float32)
-            model([_dummy_x, _dummy_cond])
             model.load_weights(model_file)
         else:
              print(f"Generative Model file not found: {model_file}")
@@ -622,21 +636,22 @@ class NASA_Dataset(Dataset):
              
              condition = np.hstack([combo_norm, target_norm])
              
-             # Generate
+             # Generate using tsgm model API
              if self.generative_model_name == 'ConditionalVAE':
-                 z_sample = np.random.normal(size=(self.gen_samples_per_combo, latent_dim))
-                 x_gen_norm = model.decoder.predict([z_sample, condition], verbose=0)
-             elif hasattr(model, 'generate'):
-                 x_gen_norm = model.generate(condition, self.gen_samples_per_combo)
-             else:
-                 # Fallback for models that might not have a dedicated generate method yet
-                 print(f"Model {self.generative_model_name} does not have a generate method.")
-                 continue
+                  # Use cBetaVAE's generate method: generate(labels) -> (data, labels)
+                  x_gen_norm, _ = model.generate(condition)
+                  if hasattr(x_gen_norm, 'numpy'):
+                       x_gen_norm = x_gen_norm.numpy()
+             elif self.generative_model_name == 'TimeGAN':
+                  # Use ConditionalGAN's generate method: generate(num, labels) -> data
+                  x_gen_norm = model.generate(self.gen_samples_per_combo, condition)
+                  if hasattr(x_gen_norm, 'numpy'):
+                       x_gen_norm = x_gen_norm.numpy()
              
              # Convert to numpy if it's a tensor
              if hasattr(x_gen_norm, 'numpy'):
-                 x_gen_norm = x_gen_norm.numpy()
-                 
+                  x_gen_norm = x_gen_norm.numpy()
+                  
              # Denormalize Signal
              x_gen = x_gen_norm * (sig_std + 1e-8) + sig_mean
              

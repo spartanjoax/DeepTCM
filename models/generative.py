@@ -1,292 +1,70 @@
 import keras
 from keras import layers
 import keras.ops as ops
-import numpy as np
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+
 import os
-from joblib import dump
+from joblib import dump, load
 from helpers import compute_mean_std
-from data.transforms import StdScalerTransform
+from data.transforms import StdScalerTransform, MinMaxScalerTransform
 
-class Sampling(layers.Layer):
-    """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
-    def call(self, inputs):
-        z_mean, z_log_var = inputs
-        batch = ops.shape(z_mean)[0]
-        dim = ops.shape(z_mean)[1]
-        epsilon = keras.random.normal(shape=(batch, dim))
-        return z_mean + ops.exp(0.5 * z_log_var) * epsilon
+import gc
 
-class ConditionalVAE(keras.Model):
+# tsgm imports
+import tsgm
+
+from tqdm import tqdm
+import numpy as np
+
+import torch
+import matplotlib.pyplot as plt
+
+
+def train_generative_model(model_class_name, dataset, sliding_window_size, sliding_window_stride, 
+                           latent_dim=16, epochs=200, batch_size=128, output_dir='generative_results', 
+                           normalization_type='minmax'):
     """
-    Conditional Variational Autoencoder for signal generation.
-    Using Conv1D/Conv1DTranspose for better signal feature extraction.
-    Conditioned on process variables and target wear.
+    Generic training function for generative models using tsgm zoo architectures.
     """
-    def __init__(self, input_shape, cond_dim, latent_dim=16, **kwargs):
-        super().__init__(**kwargs)
-        self.input_shape_val = input_shape # (Time, Channels)
-        self.cond_dim = cond_dim
-        self.latent_dim = latent_dim
-
-        # --- Encoder ---
-        encoder_inputs = layers.Input(shape=input_shape)
-        cond_inputs = layers.Input(shape=(cond_dim,))
-        
-        x = layers.Conv1D(32, kernel_size=3, strides=2, padding="same", activation="relu")(encoder_inputs)
-        x = layers.Conv1D(64, kernel_size=3, strides=2, padding="same", activation="relu")(x)
-        x = layers.Flatten()(x)
-        
-        # Concatenate condition at the bottleneck
-        x_cond = layers.Concatenate()([x, cond_inputs])
-        x_enc = layers.Dense(64, activation="relu")(x_cond)
-        x_enc = layers.Dense(32, activation="relu")(x_enc)
-        
-        z_mean = layers.Dense(latent_dim, name="z_mean")(x_enc)
-        z_log_var = layers.Dense(latent_dim, name="z_log_var")(x_enc)
-        z = Sampling()([z_mean, z_log_var])
-        
-        self.encoder = keras.Model([encoder_inputs, cond_inputs], [z_mean, z_log_var, z], name="encoder")
-
-        # --- Decoder ---
-        latent_inputs = layers.Input(shape=(latent_dim,))
-        decoder_cond_inputs = layers.Input(shape=(cond_dim,))
-        
-        # Merge latent and condition
-        x_dec = layers.Concatenate()([latent_inputs, decoder_cond_inputs])
-        x_dec = layers.Dense(32, activation="relu")(x_dec)
-        x_dec = layers.Dense(64, activation="relu")(x_dec)
-        
-        # Dynamic calculation for Conv1DTranspose start shape
-        # We did 2 strides of 2 in encoder, so Time -> Time // 4
-        # Note: This might need adjustment based on exact seq_len
-        initial_time = input_shape[0] // 4
-        x_dec = layers.Dense(initial_time * 64, activation="relu")(x_dec)
-        x_dec = layers.Reshape((initial_time, 64))(x_dec)
-        
-        x_dec = layers.Conv1DTranspose(64, kernel_size=3, strides=2, padding="same", activation="relu")(x_dec)
-        x_dec = layers.Conv1DTranspose(32, kernel_size=3, strides=2, padding="same", activation="relu")(x_dec)
-        
-        # Final layer to match input_shape (Time, Channels)
-        # We use a final Conv1D and possibly a Cropping layer if there's a slight mismatch
-        # For simplicity in this implementation, we assume Time is a multiple of 4.
-        outputs = layers.Conv1D(input_shape[1], kernel_size=3, padding="same", activation="linear")(x_dec)
-        
-        self.decoder = keras.Model([latent_inputs, decoder_cond_inputs], outputs, name="decoder")
-
-        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
-        self.reconstruction_loss_tracker = keras.metrics.Mean(name="reconstruction_loss")
-        self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss")
-
-    @property
-    def metrics(self):
-        return [
-            self.total_loss_tracker,
-            self.reconstruction_loss_tracker,
-            self.kl_loss_tracker,
-        ]
-
-    def train_step(self, data):
-        # data is ([x, cond], x) - typical VAE training input/output
-        if isinstance(data, tuple) or isinstance(data, list):
-            x, cond = data[0]
-        else:
-            x, cond = data
-            
-        with ops.gradient_tape.GradientTape() as tape:
-            z_mean, z_log_var, z = self.encoder([x, cond])
-            reconstruction = self.decoder([z, cond])
-            
-            reconstruction_loss = ops.mean(
-                ops.sum(
-                    keras.losses.mean_squared_error(x, reconstruction),
-                    axis=(1, 2)
-                )
-            )
-            kl_loss = -0.5 * (1 + z_log_var - ops.square(z_mean) - ops.exp(z_log_var))
-            kl_loss = ops.mean(ops.sum(kl_loss, axis=1))
-            total_loss = reconstruction_loss + kl_loss
-            
-        grads = tape.gradient(total_loss, self.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
-        
-        self.total_loss_tracker.update_state(total_loss)
-        self.reconstruction_loss_tracker.update_state(reconstruction_loss)
-        self.kl_loss_tracker.update_state(kl_loss)
-        
-        return {
-            "loss": self.total_loss_tracker.result(),
-            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
-            "kl_loss": self.kl_loss_tracker.result(),
-        }
-
-    def call(self, inputs):
-        x, cond = inputs
-        _, _, z = self.encoder([x, cond])
-        return self.decoder([z, cond])
-
-class TimeGAN(keras.Model):
-    """
-    TimeGAN architecture for synthetic signal generation.
-    Simplified Keras 3 implementation based on the original TimeGAN paper.
-    """
-    def __init__(self, seq_len, n_features, cond_dim, latent_dim=24, **kwargs):
-        super().__init__(**kwargs)
-        self.seq_len = seq_len
-        self.n_features = n_features
-        self.cond_dim = cond_dim
-        self.latent_dim = latent_dim
-
-        # 1. Embedder
-        e_in = layers.Input(shape=(seq_len, n_features))
-        x = layers.GRU(latent_dim, return_sequences=True)(e_in)
-        x = layers.GRU(latent_dim, return_sequences=True)(x)
-        e_out = layers.Dense(latent_dim, activation="sigmoid")(x)
-        self.embedder = keras.Model(e_in, e_out, name="embedder")
-
-        # 2. Recovery
-        r_in = layers.Input(shape=(seq_len, latent_dim))
-        x = layers.GRU(latent_dim, return_sequences=True)(r_in)
-        x = layers.GRU(latent_dim, return_sequences=True)(x)
-        r_out = layers.Dense(n_features, activation="linear")(x)
-        self.recovery = keras.Model(r_in, r_out, name="recovery")
-
-        # 3. Generator
-        g_in = layers.Input(shape=(seq_len, latent_dim))
-        g_cond = layers.Input(shape=(cond_dim,))
-        # Repeat condition for each time step
-        repeated_cond = layers.RepeatVector(seq_len)(g_cond)
-        x = layers.Concatenate()([g_in, repeated_cond])
-        x = layers.GRU(latent_dim, return_sequences=True)(x)
-        x = layers.GRU(latent_dim, return_sequences=True)(x)
-        g_out = layers.Dense(latent_dim, activation="sigmoid")(x)
-        self.generator = keras.Model([g_in, g_cond], g_out, name="generator")
-
-        # 4. Discriminator
-        d_in = layers.Input(shape=(seq_len, latent_dim))
-        x = layers.GRU(latent_dim, return_sequences=True)(d_in)
-        x = layers.GRU(latent_dim, return_sequences=True)(x)
-        d_out = layers.Dense(1, activation="linear")(x) # Logits
-        self.discriminator = keras.Model(d_in, d_out, name="discriminator")
-
-    def call(self, inputs):
-        # inputs: [noise, cond]
-        return self.recovery(self.generator(inputs))
-
-    # TimeGAN training logic involves multiple loss functions
-    def train_step(self, data):
-        # x: (Batch, SeqLen, Features), cond: (Batch, CondDim)
-        x, cond = data[0]
-        
-        # 1. Embedding Network training (Supervised + Reconstruction)
-        with ops.gradient_tape.GradientTape() as tape:
-            h = self.embedder(x)
-            x_tilde = self.recovery(h)
-            h_hat_supervise = self.generator([h[:, :-1, :], cond]) # Supervised next-step
-            
-            # Reconstruction Loss
-            loss_recovery = ops.mean(keras.losses.mean_squared_error(x, x_tilde))
-            # Supervised Loss
-            loss_supervised = ops.mean(keras.losses.mean_squared_error(h[:, 1:, :3], h_hat_supervise[:, :, :3]))
-            
-            loss_embed = loss_recovery + 0.1 * loss_supervised
-            
-        grads = tape.gradient(loss_embed, self.embedder.trainable_weights + self.recovery.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.embedder.trainable_weights + self.recovery.trainable_weights))
-
-        # 2. Generator & Discriminator training (Adversarial)
-        # (Simplified for Keras 3 train_step)
-        batch_size = ops.shape(x)[0]
-        z = keras.random.normal(shape=(batch_size, self.seq_len, self.latent_dim))
-        
-        with ops.gradient_tape.GradientTape() as gen_tape, ops.gradient_tape.GradientTape() as disc_tape:
-            h_fake = self.generator([z, cond])
-            x_fake = self.recovery(h_fake)
-            
-            y_real = self.discriminator(h)
-            y_fake = self.discriminator(h_fake)
-            
-            # Adversarial Losses
-            loss_disc = ops.mean(keras.losses.binary_crossentropy(ops.ones_like(y_real), ops.sigmoid(y_real))) + \
-                        ops.mean(keras.losses.binary_crossentropy(ops.zeros_like(y_fake), ops.sigmoid(y_fake)))
-            
-            loss_gen = ops.mean(keras.losses.binary_crossentropy(ops.ones_like(y_fake), ops.sigmoid(y_fake)))
-            
-        # Optimization
-        # In a real TimeGAN, these are carefully weighted.
-        return {"loss_embed": loss_embed, "loss_gen": loss_gen, "loss_disc": loss_disc}
-
-class TimeGrad(keras.Model):
-    """
-    TimeGrad implementation using Denoising Diffusion.
-    Conditioned on process variables and wear.
-    """
-    def __init__(self, seq_len, n_features, cond_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.seq_len = seq_len
-        self.n_features = n_features
-        self.cond_dim = cond_dim
-        
-        # Denoising Backbone
-        self.backbone = keras.Sequential([
-            layers.Input(shape=(seq_len, n_features + cond_dim + 1)),
-            layers.Conv1D(64, kernel_size=3, padding="same", activation="relu"),
-            layers.LSTM(64, return_sequences=True),
-            layers.Dense(n_features)
-        ])
-        
-    def train_step(self, data):
-        x, cond = data[0]
-        batch_size = ops.shape(x)[0]
-        t = keras.random.uniform(shape=(batch_size, 1, 1), minval=0, maxval=1)
-        noise = keras.random.normal(shape=ops.shape(x))
-        
-        # Add noise based on t (Simplified Diffusion)
-        x_noisy = x * (1 - t) + noise * t
-        
-        # Prepare inputs for backbone
-        # Condition is (Batch, CondDim) -> Repeat to (Batch, SeqLen, CondDim)
-        cond_rep = ops.repeat(ops.expand_dims(cond, axis=1), self.seq_len, axis=1)
-        t_rep = ops.repeat(t, self.seq_len, axis=1)
-        
-        inputs = ops.concatenate([x_noisy, cond_rep, t_rep], axis=-1)
-        
-        with ops.gradient_tape.GradientTape() as tape:
-            pred_noise = self.backbone(inputs)
-            loss = ops.mean(keras.losses.mean_squared_error(noise, pred_noise))
-            
-        grads = tape.gradient(loss, self.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
-        return {"loss": loss}
-
-    def generate(self, cond, num_samples):
-        # Simple one-step denoising for speed in tuning
-        z = keras.random.normal(shape=(num_samples, self.seq_len, self.n_features))
-        cond_rep = ops.repeat(ops.expand_dims(cond, axis=1), self.seq_len, axis=1)
-        t = ops.ones((num_samples, self.seq_len, 1))
-        
-        inputs = ops.concatenate([z, cond_rep, t], axis=-1)
-        pred_noise = self.backbone(inputs)
-        return z - pred_noise # Denoised signal
-
-def train_generative_model(model_class, dataset, sliding_window_size, sliding_window_stride, 
-                           latent_dim=16, epochs=200, batch_size=32, output_dir='generative_results'):
-    """
-    Generic training function for generative models.
-    """
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Training on device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
-    model_name = model_class.__name__
-    print(f"Starting training for {model_name}...")
+    print(f"Starting training for {model_class_name}...")
 
     # Normalize Data
-    mean, std = compute_mean_std(dataset)
-    scaler = StdScalerTransform(mean=mean, std=std)
+    x_train_raw = ops.convert_to_tensor(dataset.data) # Tensor (N, W, C)
     
+    mean_tensor = None
+    std_tensor = None
+    data_min = None
+    data_max = None
+    scaler = None
+
+    if normalization_type == 'minmax':
+        # MinMax Normalization
+        x_flat = ops.reshape(x_train_raw, (-1, x_train_raw.shape[2]))
+        data_min = ops.min(x_flat, axis=0) # (C,)
+        data_max = ops.max(x_flat, axis=0) # (C,)
+        scaler = MinMaxScalerTransform(min=data_min, max=data_max)
+    elif normalization_type == 'standard':
+        # Standard (Z-score) Normalization
+        mean, std = compute_mean_std(dataset)
+        mean_tensor = ops.convert_to_tensor(mean)
+        std_tensor = ops.convert_to_tensor(std)
+        scaler = StdScalerTransform(mean=mean_tensor, std=std_tensor)
+    else:
+        raise ValueError(f"Unknown normalization_type: {normalization_type}")
     # Extract data from dataset
-    x_train = dataset.data # Tensor (N, W, C)
-    x_proc = dataset.proc_data # Tensor (N, P_total)
-    y_train = dataset.targets # Tensor (N, 1)
+    x_train = ops.convert_to_tensor(dataset.data) # Tensor (N, W, C)
+    x_proc = ops.convert_to_tensor(dataset.proc_data) # Tensor (N, P_total)
+    y_train = ops.convert_to_tensor(dataset.targets) # Tensor (N, 1)
     
     # Condition: DOC, feed, material, Vc (first 4) + target (last)
     base_proc_params = x_proc[:, :4]
@@ -314,37 +92,328 @@ def train_generative_model(model_class, dataset, sliding_window_size, sliding_wi
     seq_len = x_train_norm.shape[1]
     cond_dim = condition_vector.shape[1]
     
-    # Initialize Model
-    if model_name == 'ConditionalVAE':
-        model = model_class(input_shape=(seq_len, feature_dim), cond_dim=cond_dim, latent_dim=latent_dim)
-    elif model_name == 'TimeGAN':
-        model = model_class(seq_len=seq_len, n_features=feature_dim, cond_dim=cond_dim, latent_dim=latent_dim)
-    elif model_name == 'TimeGrad':
-        model = model_class(seq_len=seq_len, n_features=feature_dim, cond_dim=cond_dim)
-        
-    optimizer = keras.optimizers.Adam(learning_rate=1e-3)
-    model.compile(optimizer=optimizer)
-    
-    # Train
-    print("Fitting model...")
-    # fit expects ([x, cond], x) for VAE or similar
-    model.fit([x_train_norm, condition_vector], x_train_norm, epochs=epochs, batch_size=batch_size, shuffle=True)
-    
-    # Save Model and Stats
+    # Save Scaler Stats and Params ONCE (Global)
     suffix = f"sw{sliding_window_size}_ss{sliding_window_stride}"
-    weights_path = os.path.join(output_dir, f"{model_name}_{suffix}.weights.h5")
-    model.save_weights(weights_path)
     
-    scaler_stats = {
-        'signal_mean': mean.numpy() if hasattr(mean, 'numpy') else mean,
-        'signal_std': std.numpy() if hasattr(std, 'numpy') else std,
-        'proc_min': proc_min.numpy() if hasattr(proc_min, 'numpy') else proc_min,
-        'proc_max': proc_max.numpy() if hasattr(proc_max, 'numpy') else proc_max,
-        'target_min': y_min.numpy() if hasattr(y_min, 'numpy') else y_min,
-        'target_max': y_max.numpy() if hasattr(y_max, 'numpy') else y_max
-    }
-    stats_path = os.path.join(output_dir, f"{model_name}_scaler_{suffix}.joblib")
+    scaler_stats = {'normalization_type': normalization_type}
+    if normalization_type == 'minmax':
+        scaler_stats['signal_min'] = ops.convert_to_numpy(data_min)
+        scaler_stats['signal_max'] = ops.convert_to_numpy(data_max)
+    elif normalization_type == 'standard':
+        scaler_stats['signal_mean'] = ops.convert_to_numpy(mean_tensor)
+        scaler_stats['signal_std'] = ops.convert_to_numpy(std_tensor)
+        
+    scaler_stats.update({
+        'proc_min': ops.convert_to_numpy(proc_min),
+        'proc_max': ops.convert_to_numpy(proc_max),
+        'target_min': ops.convert_to_numpy(y_min),
+        'target_max': ops.convert_to_numpy(y_max)
+    })
+    stats_path = os.path.join(output_dir, f"{model_class_name}_scaler_{suffix}.joblib")
     dump(scaler_stats, stats_path)
+    print(f"Scaler stats saved to {stats_path}")
+
+    # Loop over channels to train separate models
+    models = []
     
-    print(f"Training complete. Weights saved to {weights_path}, stats to {stats_path}")
-    return model
+    for ch in range(feature_dim):
+        print(f"Training {model_class_name} for Channel {ch}/{feature_dim-1}...")
+        
+        # Extract single channel data: (N, T, 1)
+        x_train_ch = x_train_norm[:, :, ch:ch+1]
+        
+        # Use tsgm zoo architectures (feat_dim=1)
+        if model_class_name == 'ConditionalVAE':
+            # Use cvae_conv5 from zoo
+            # https://github.com/AlexanderVNikitin/tsgm/blob/main/tutorials/VAEs/cVAE.ipynb
+            architecture = tsgm.models.architectures.zoo["cvae_conv5"](
+                seq_len=seq_len, 
+                feat_dim=1, # Single channel
+                latent_dim=latent_dim, 
+                output_dim=cond_dim
+            )
+            encoder = architecture.encoder
+            decoder = architecture.decoder
+            
+            model = tsgm.models.cvae.cBetaVAE(
+                encoder=encoder, 
+                decoder=decoder, 
+                latent_dim=latent_dim,
+                temporal=False,  # Static labels per sample
+                beta=0.5
+            )
+            optimizer = keras.optimizers.Adam(learning_rate=1e-3)
+            model.compile(optimizer=optimizer)
+            
+        elif model_class_name == 'TimeGAN':
+            # Use cgan_lstm_3 from zoo
+            # https://github.com/AlexanderVNikitin/tsgm/blob/main/tutorials/GANs/cGAN.ipynb
+            architecture = tsgm.models.architectures.zoo["cgan_lstm_3"](
+                seq_len=seq_len, 
+                feat_dim=1, # Single channel
+                latent_dim=latent_dim, 
+                output_dim=cond_dim
+            )
+            discriminator = architecture.discriminator
+            generator = architecture.generator
+           
+            model = tsgm.models.cgan.ConditionalGAN(
+                discriminator=discriminator,
+                generator=generator,
+                latent_dim=latent_dim,
+                temporal=False  # Static labels per sample
+            )
+            d_optimizer = keras.optimizers.Adam(learning_rate=1e-4)
+            g_optimizer = keras.optimizers.Adam(learning_rate=1e-4)
+            loss_fn = keras.losses.BinaryCrossentropy(from_logits=True)
+            model.compile(d_optimizer=d_optimizer, g_optimizer=g_optimizer, loss_fn=loss_fn)
+        else:
+            raise ValueError(f"Unknown generative model name: {model_class_name}")
+            
+        es = EarlyStopping(monitor='loss', mode='min', verbose=1, patience=5, min_delta=0.1, restore_best_weights=True)
+
+        # Train
+        print(f"Fitting model for Channel {ch}...")
+        model.fit(x=x_train_ch, y=condition_vector, epochs=epochs, 
+                  batch_size=batch_size)#, callbacks=[es])
+        
+        # --- Debug: Save Reconstruction Plot for first few channels ---
+        # Select random sample
+        idx = np.random.randint(0, x_train_ch.shape[0])
+        sample_x = x_train_ch[idx:idx+1] # (1, T, 1)
+        sample_c = condition_vector[idx:idx+1] # (1, C)
+        print(f'Shape sample X {sample_x.shape} - Shape sample C {sample_c.shape}')
+            
+        recon = None
+        if model_class_name == 'ConditionalVAE':
+            # cBetaVAE call inputs: [x, cond]
+            print('Making predictions with cVAE')
+            recon = model.predict([sample_x, sample_c], verbose=0)
+        print(f'Shape of reconstructions {recon.shape}')
+        
+        if recon is not None:
+            # Generate new sample from same condition
+            gen_sample = None
+            if model_class_name == 'ConditionalVAE':
+                    gen_sample, _ = model.generate(sample_c)
+            elif model_class_name == 'TimeGAN':
+                    gen_sample = model.generate(sample_c)
+
+            plt.figure(figsize=(10, 4))
+            plt.plot(sample_x[0, :, 0].cpu().numpy(), label='Original')
+            plt.plot(recon[0, :, 0], label='Reconstruction')
+            if gen_sample is not None:
+                    # Move to cpu/numpy if needed
+                    if hasattr(gen_sample, 'cpu'): gen_sample = gen_sample.cpu().detach().numpy()
+                    plt.plot(gen_sample[0, :, 0], label='Generated', alpha=0.7, linestyle='--')
+            
+            plt.title(f'Train Debug: Ch{ch} Recon vs Gen (Epochs={epochs})')
+            plt.legend()
+            debug_path = os.path.join(output_dir, f'debug_recon_gen_{model_class_name}_ch{ch}.png')
+            print(f'Debug path for plots is {debug_path}')
+            plt.savefig(debug_path)
+            plt.close()
+            print(f"Saved debug reconstruction/generation plot to {debug_path}")
+                
+        # Save Model Weights for Channel
+        
+        # Save Model Weights for Channel
+        weights_path = os.path.join(output_dir, f"{model_class_name}_{suffix}_ch{ch}.weights.h5")
+        model.save_weights(weights_path)
+        print(f"Channel {ch} weights saved to {weights_path}")
+        
+        models.append(model)
+        
+        # Cleanup Channel Model
+        # del model
+        # keras.utils.clear_session()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+    
+    print(f"Training complete for all {feature_dim} channels.")
+    
+    # Cleanup
+    keras.utils.clear_session()
+    gc.collect()
+    
+    return models
+
+
+def generate_synthetic_data(model_class_name, gen_config, num_samples, 
+                            condition_data=None, x_train_info=None, latent_dim=16):
+    """
+    Generate synthetic data using a trained generative model.
+    Replicates the logic used in PreprocessingTuner for consistency, including balanced sampling.
+    """
+    
+    output_dir = gen_config['output_dir']
+    sliding_window_size = gen_config['sliding_window_size']
+    sliding_window_stride = gen_config['sliding_window_stride']
+    curr_mean = gen_config['current_mean']
+    curr_std = gen_config['current_std']
+    normalization_type = gen_config['normalization_type']
+    
+    suffix = f"sw{sliding_window_size}_ss{sliding_window_stride}"
+    
+    # Load Stats and Params
+    stats_path = os.path.join(output_dir, f"{model_class_name}_scaler_{suffix}.joblib")
+    if not os.path.exists(stats_path):
+        print(f"Error: Scaler stats not found at {stats_path}. Aborting.")
+        return None, None
+        
+    scaler_stats = load(stats_path)
+    print(scaler_stats)
+    # Prefer normalization type from saved stats, fallback to config
+    gen_norm_type = scaler_stats.get('normalization_type', normalization_type)
+    
+    gen_min = None
+    gen_max = None
+    gen_mean = None
+    gen_std = None
+
+    if gen_norm_type == 'minmax':
+        gen_min = scaler_stats['signal_min']
+        gen_max = scaler_stats['signal_max']
+        feature_dim = gen_min.shape[0]
+    elif gen_norm_type == 'standard':
+        gen_mean = scaler_stats['signal_mean']
+        gen_std = scaler_stats['signal_std']
+        feature_dim = gen_mean.shape[0]
+    
+    cond_dim = condition_data.shape[1]
+    seq_len = sliding_window_size
+    
+    # Check if ANY channel weights exist to decide whether to proceed
+    first_ch_path = os.path.join(output_dir, f"{model_class_name}_{suffix}_ch0.weights.h5")
+    if not os.path.exists(first_ch_path):
+         print(f"Warning: Channel 0 weights not found at {first_ch_path}. Skipping.")
+         return None, None
+
+    # Prepare Sampling Indices ONCE (Shared across all channels to maintain correlations if any, though independent generation breaks inter-channel corr)
+    # Balanced Sampling Logic
+    if x_train_info is not None:
+        unique_proc, unique_indices = np.unique(x_train_info, axis=0, return_inverse=True)
+        num_unique = len(unique_proc)
+        n_per_unique = num_samples // num_unique
+        remainder = num_samples % num_unique
+        
+        idx = []
+        for i in range(num_unique):
+            matching_indices = np.where(unique_indices == i)[0]
+            count = n_per_unique + (1 if i < remainder else 0)
+            if len(matching_indices) > 0:
+                sampled = np.random.choice(matching_indices, count, replace=True)
+                idx.extend(sampled)
+        idx = np.array(idx)
+        np.random.shuffle(idx)
+        sampled_cond = condition_data[idx]
+    else:
+        # Fallback to simple random sampling
+        idx = np.random.randint(0, condition_data.shape[0], num_samples)
+        sampled_cond = condition_data[idx]
+    
+    generated_channels = []
+    
+    for ch in range(feature_dim):
+        print(f"Generating {model_class_name} for Channel {ch}/{feature_dim-1}...")
+        weights_path = os.path.join(output_dir, f"{model_class_name}_{suffix}_ch{ch}.weights.h5")
+        
+        if not os.path.exists(weights_path):
+            print(f"Error: Weights for channel {ch} not found. Aborting.")
+            return None, None
+            
+        # Instantiate Model Architecture (feat_dim=1)
+        model = None
+        if model_class_name == 'ConditionalVAE':
+            architecture = tsgm.models.architectures.zoo["cvae_conv5"](
+                seq_len=seq_len, feat_dim=1, latent_dim=latent_dim, output_dim=cond_dim
+            )
+            model = tsgm.models.cvae.cBetaVAE(
+                encoder=architecture.encoder, decoder=architecture.decoder,
+                latent_dim=latent_dim, temporal=False, beta=0.5
+            )
+        elif model_class_name == 'TimeGAN':
+            architecture = tsgm.models.architectures.zoo["cgan_lstm_3"](
+                seq_len=seq_len, feat_dim=1, latent_dim=latent_dim, output_dim=cond_dim
+            )
+            model = tsgm.models.cgan.ConditionalGAN(
+                discriminator=architecture.discriminator, generator=architecture.generator,
+                latent_dim=latent_dim, temporal=False
+            )
+        
+        # Build & Load
+        try:
+            input_shapes = [(None, seq_len, 1), (None, cond_dim)]
+            model.build(input_shapes)
+            model.load_weights(weights_path)
+        except Exception as e:
+            print(f"Error loading generative model {model_class_name} Channel {ch}: {e}")
+            return None, None
+        
+        # Generate Channel Data
+        channel_signal = []
+        batch_size = 100
+        num_batches = int(np.ceil(num_samples / batch_size))
+        
+        for b in tqdm(range(num_batches), desc=f"Gen Ch {ch}"):
+            start = b * batch_size
+            end = min((b + 1) * batch_size, num_samples)
+            batch_cond = sampled_cond[start:end]
+            
+            batch_syn = None
+            if model_class_name == "ConditionalVAE":
+                 batch_syn, _ = model.generate(batch_cond)
+            elif model_class_name == "TimeGAN":
+                 batch_syn = model.generate(batch_cond)
+                 
+            if batch_syn is not None:
+                 if hasattr(batch_syn, 'numpy'):
+                     batch_syn = batch_syn.cpu().detach().numpy()
+                 elif hasattr(batch_syn, 'detach'):
+                     batch_syn = batch_syn.detach().cpu().numpy()
+                 channel_signal.append(batch_syn)
+    
+            del batch_syn
+            torch.cuda.empty_cache()
+            
+        if len(channel_signal) > 0:
+            channel_full = np.concatenate(channel_signal, axis=0) # (N, T, 1)
+            generated_channels.append(channel_full)
+        else:
+             return None, None
+             
+        # Cleanup Channel Model
+        del model
+        keras.utils.clear_session()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Concatenate Channels
+    if len(generated_channels) == feature_dim:
+        synthetic_signal = np.concatenate(generated_channels, axis=2) # (N, T, C)
+    else:
+        print("Error: Dimension mismatch in generated channels.")
+        return None, None
+
+        
+    # Denormalize (Generator Scale) -> Normalize (Current Run Scale)
+    print(f'Current mean: {curr_mean} - Std: {curr_std}')
+    
+    syn_raw = None
+    if gen_norm_type == 'minmax':
+        # Inverse MinMax: x_raw = x_norm * (max - min) + min
+        gen_range = gen_max - gen_min
+        gen_range = np.where(gen_range == 0, 1.0, gen_range)
+        syn_raw = synthetic_signal * gen_range + gen_min
+    elif gen_norm_type == 'standard':
+        syn_raw = synthetic_signal * gen_std + gen_mean
+        
+    safe_std = np.where(curr_std == 0, 1.0, curr_std)
+    syn_renorm = (syn_raw - curr_mean) / safe_std
+    
+    # Cleanup
+    keras.utils.clear_session()
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return syn_renorm, sampled_cond
