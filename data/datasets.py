@@ -46,7 +46,8 @@ class NASA_Dataset(Dataset):
                  gen_samples_per_combo=200,
                  extract_features=False,
                  apply_averaging=True,
-                 avg_window_size=10):
+                 avg_window_size=10,
+                 windowing=True):
         """
         Custom DataLoader for the NASA-Ames face-milling dataset with train/val/test split support.
 
@@ -104,7 +105,10 @@ class NASA_Dataset(Dataset):
         assert split_type in ['runs', 'cases'], f'Variable must be one of "runs" or "cases"'
         assert signal_group in allowed_signal_group, f'Variable must be one of {allowed_signal_group}'
 
-        data_file_name = f'data/nasa_{sliding_window_size}_{sliding_window_stride}{f"_ma{avg_window_size}" if apply_averaging else ""}.bin'
+        if windowing:
+            data_file_name = f'data/nasa_{sliding_window_size}_{sliding_window_stride}{f"_ma{avg_window_size}" if apply_averaging else ""}.bin'
+        else:
+            data_file_name = f'data/nasa{f"_ma{avg_window_size}" if apply_averaging else ""}.bin'
 
         if not os.path.exists(data_file_name):
             print('================== NASA dataset files do not exist\nProcessing and saving splits')
@@ -243,7 +247,10 @@ class NASA_Dataset(Dataset):
         if debug_plots:
             plot_signals(x, NASA_Dataset.signal_list, signal_chanel=2)
 
-        x, x_process_params, y = augment_signal(x, x_process_params, y, window_size=sliding_window_size, stride=sliding_window_stride)
+        if windowing:
+            x, x_process_params, y = augment_signal(x, x_process_params, y, window_size=sliding_window_size, stride=sliding_window_stride)
+        else:
+            print('================== Data NOT augmented (Windowing=False)')
         
         if debug_plots:
             plot_signals(x, NASA_Dataset.signal_list, signal_chanel=2)
@@ -383,6 +390,7 @@ class NASA_Dataset(Dataset):
         #case 8-3 (AE_T)
         #case 12-1 - Corrupt data and noise
         #case 12-12 - Singularity event
+        print(f'Shape of signals before filtering bad runs:{data_file.shape}')
         data_file = data_file[(data_file['case'] != 1) | (data_file['run'] <= 15)]
         data_file = data_file[(data_file['case'] != 2) | (data_file['run'] != 5)]
         data_file = data_file[(data_file['case'] != 2) | (data_file['run'] != 6)]
@@ -390,9 +398,7 @@ class NASA_Dataset(Dataset):
         data_file = data_file[(data_file['case'] != 8) | (data_file['run'] != 3)]
         data_file = data_file[(data_file['case'] != 12) | (data_file['run'] != 1)]
         data_file = data_file[(data_file['case'] != 12) | (data_file['run'] != 12)]
-        
-        # Drop data for tool wear higher than 0.4 - No industrial applicability
-        data_file = data_file[(data_file['VB'] <= 0.4)]
+        print(f'Shape of signals after filtering bad runs:{data_file.shape}')
 
         data_file['Vc'] = 200
         data_file['Vc'] = data_file['Vc'].astype(float)
@@ -406,6 +412,11 @@ class NASA_Dataset(Dataset):
                 data_file.loc[(data_file['case']==x) & (data_file['run']==y), 'VB interpolated'] = vb
 
         data_file = data_file.drop(columns=['time','VB']).rename(columns={'VB interpolated':'VB'})
+        
+        # Drop data for tool wear higher than 0.4 - No industrial applicability
+        data_file = data_file[(data_file['VB'] <= 0.4)]
+        print(f'Shape of signals after filtering tool wear:{data_file.shape}')
+        
         print('================== NASA dataset cleaned and VB interpolated')
         print(f'VB - min: {data_file["VB"].min()} - max: {data_file["VB"].max()}')
 
@@ -990,17 +1001,7 @@ class MU_TCM_Dataset(Dataset):
         if self.debug_plots:
             plot_signals(x, MU_TCM_Dataset.signal_list)
 
-        # print('================== Augmenting signals')
-        # x, x_proc_params, y = augment_signal(x, x_proc_params, y, window_size=sliding_window_size, stride=sliding_window_stride)
-
-        if self.debug_plots:
-            plot_signals(x, MU_TCM_Dataset.signal_list)
-
         x = np.transpose(x, (0, 2, 1))
-        # print('Signals shape after augmentation:', x.shape)
-        # print('Parameters shape after augmentation:', x_proc_params.shape)
-        # print('Labels shape after augmentation:', y.shape)
-        # print('================== Data augmented')
 
         if self.debug_plots:
             plot_signals(x, MU_TCM_Dataset.signal_list, signal_chanel=2)

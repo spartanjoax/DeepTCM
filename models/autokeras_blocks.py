@@ -278,13 +278,14 @@ class SignalBlock(ak.Block):
         block_type: Optional[Union[str, hyperparameters.Choice]] = None,
         normalize: Optional[Union[bool, hyperparameters.Boolean]] = None,
         augment: Optional[Union[bool, hyperparameters.Boolean]] = None,
+        use_lstm = None,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.block_type = utils.get_hyperparameter(
             block_type,
             hyperparameters.Choice(
-                "block_type", ["resnet", "xception", "transformer"], default="transformer"
+                "block_type", ["vanilla", "xception", "transformer"], default="transformer"
             ),
             str,
         )
@@ -296,6 +297,11 @@ class SignalBlock(ak.Block):
         self.augment = utils.get_hyperparameter(
             augment,
             hyperparameters.Boolean("augment", default=False),
+            bool,
+        )
+        self.use_lstm = utils.get_hyperparameter(
+            use_lstm,
+            hyperparameters.Boolean("use_lstm", default=False),
             bool,
         )
 
@@ -327,11 +333,6 @@ class SignalBlock(ak.Block):
         input_node = tree.flatten(inputs)[0]
         output_node = input_node
 
-        if self.normalize is None:
-            # This path is actually covered by the get_hyperparameter logic if default is hp,
-            # but utils.add_to_hp handles it nicely.
-            pass
-
         normalize = utils.add_to_hp(self.normalize, hp)
         if normalize:
             with hp.conditional_scope("normalize", [True]):
@@ -347,19 +348,21 @@ class SignalBlock(ak.Block):
              output_node = self._build_block(hp, output_node, block_type)
 
         if block_type != "transformer":
-            # GlobalPooling for CNNs to get (B, C)
-            output_node = layers.GlobalAveragePooling2D(data_format="channels_last")(output_node)
-            output_node = layers.Dense(32, activation='relu')(output_node)
-            
-            # Reshape to (B, 1, C) for RNN.
-            # We use (1, C) instead of (C, 1) because:
-            # 1. Performance: Processing 2048+ channels as time steps is extremely slow and hard to learn.
-            # 2. Semantics: Channels are concurrent features, not a temporal sequence.
-            output_node = layers.Reshape((1, -1))(output_node)
-            
-            # Process then with RNN
-            output_node = RNNBlock(num_layers=2, units=32, 
-                            bidirectional=True, layer_type='gru').build(hp, output_node)
+            use_lstm = utils.add_to_hp(self.use_lstm, hp)
+            with hp.conditional_scope("use_lstm", [True]):
+                # GlobalPooling for CNNs to get (B, C)
+                output_node = layers.GlobalAveragePooling2D(data_format="channels_last")(output_node)
+                output_node = layers.Dense(32, activation='relu')(output_node)
+                
+                # Reshape to (B, 1, C) for RNN.
+                # We use (1, C) instead of (C, 1) because:
+                # 1. Performance: Processing 2048+ channels as time steps is extremely slow and hard to learn.
+                # 2. Semantics: Channels are concurrent features, not a temporal sequence.
+                output_node = layers.Reshape((1, -1))(output_node)
+                
+                # Process then with RNN
+                output_node = RNNBlock(num_layers=2, units=32, 
+                                bidirectional=True, layer_type='gru').build(hp, output_node)
 
         return output_node
 

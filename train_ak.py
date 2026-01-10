@@ -32,7 +32,7 @@ from models.preprocessing_tuner import PreprocessingTuner
 from models.generative import train_generative_model, generate_synthetic_data
 
 from helpers import apply_moving_average, apply_high_pass_filter, apply_low_pass_filter, apply_detrend, apply_rms
-from helpers import convert_to_cwt, convert_to_fsst, convert_to_wsst
+from helpers import convert_to_cwt, convert_to_fsst, convert_to_wsst, augment_signal
 
 split_type='runs'
 
@@ -103,17 +103,17 @@ def main(epochs=1,
                             transformX=normalize_transform, transformProc=minmax_transform, 
                             sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
                             seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset, 
-                            apply_averaging=False)
+                            apply_averaging=False, windowing=False)
     nasa_val = NASA_Dataset(split='val', signal_group=run_id, split_ratios=split_ratios, 
                             transformX=normalize_transform, transformProc=minmax_transform, 
                             sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
                             seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset, 
-                            apply_averaging=False)
+                            apply_averaging=False, windowing=False)
     nasa_test = NASA_Dataset(split='test', signal_group=run_id, split_ratios=split_ratios, 
                             transformX=normalize_transform, transformProc=minmax_transform, 
                             sliding_window_size=sliding_window_size, sliding_window_stride=sliding_window_stride,
                             seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset, 
-                            apply_averaging=False)
+                            apply_averaging=False, windowing=False)
 
     xtr, xtr_proc, ytr = nasa_train.data.cpu().data.numpy(), nasa_train.proc_data.cpu().data.numpy(), nasa_train.targets.cpu().data.numpy()
     xval, xval_proc, yval = nasa_val.data.cpu().data.numpy(), nasa_val.proc_data.cpu().data.numpy(), nasa_val.targets.cpu().data.numpy()
@@ -131,7 +131,7 @@ def main(epochs=1,
                                 sliding_window_size=sliding_window_size, 
                                 sliding_window_stride=sliding_window_stride,
                                 seed=seed,split_type=split_type, runs_per_case_test_val=runs_per_case_test_val, split_offset=split_offset, 
-                                apply_averaging=True, avg_window_size=ma_window_size)
+                                apply_averaging=True, avg_window_size=ma_window_size, windowing=True)
     
     for gen_name in gen_models_list.keys():
         suffix = f"sw{sliding_window_size}_ss{sliding_window_stride}"
@@ -212,7 +212,9 @@ def main(epochs=1,
         test_data=(test_input, yte),
         epochs=epochs,
         gen_config=gen_config,
-        ma_window_size=ma_window_size
+        ma_window_size=ma_window_size,
+        sliding_window_size=sliding_window_size,
+        sliding_window_stride=sliding_window_stride
     )
 
     total_time = time.time() - start_time
@@ -232,50 +234,15 @@ def main(epochs=1,
     if clf is None:
         print('No best inner trial')
         
-    # User Fix: Call fit on the loaded clf to ensure it's initialized
-    # We must apply the SAME PREPROCESSING to the training data that was used in the trial
-    # (excluding generative augmentation which just adds samples, assume shape is consistent)
-    
     x_train_pre = xtr
+    x_train_proc = xtr_proc 
     y_train_pre = ytr
+    
     x_val_pre = xval
-    
-    # --- 1. Generative Augmentation (Replicate best trial) ---
-    gen_type = best_hp_outer.get("gen_model_type")
-    
-    # Need to handle info augmentation if multimodal
-    x_train_info_final = None
-    if xtr_proc is not None:
-         x_train_info_final = xtr_proc
-         
-    if gen_type != "none":
-        logger.info(f"Augmenting data with {gen_type} for final fit...")
-        
-        # Prepare condition for generation (Info + Target)
-        if xtr_proc is not None:
-             cond_train = np.concatenate([xtr_proc, ytr], axis=1)
-        else:
-             cond_train = ytr
-             
-        # Generate same amount as original data (100% augmentation)
-        num_syn = int(x_train_pre.shape[0] * 1)
-        
-        syn_signal, syn_cond = generate_synthetic_data(gen_type, gen_config, num_syn, condition_data=cond_train, x_train_info=xtr_proc)
-        
-        if syn_signal is not None:
-             x_train_pre = np.concatenate([x_train_pre, syn_signal], axis=0)
-             
-             # Extract y part from condition (last column)
-             syn_y = syn_cond[:, -1:]
-             y_train_pre = np.concatenate([y_train_pre, syn_y], axis=0)
-             
-             # Extract info part if multimodal
-             if xtr_proc is not None:
-                  syn_info = syn_cond[:, :-1]
-                  x_train_info_final = np.concatenate([x_train_info_final, syn_info], axis=0)
-        else:
-             logger.warning("Generative augmentation returned None.")
-             
+    x_val_proc = xval_proc
+    y_val_pre = yval
+
+    # --- 1. Global Preprocessing (Detrend/Noise Reduction) on Full Runs ---
     # 0. Detrend
     if best_hp_outer.get("detrend") == "detrend":
         x_train_pre = apply_detrend(x_train_pre)
@@ -297,7 +264,56 @@ def main(epochs=1,
         x_train_pre = apply_rms(x_train_pre, window_size=10)
         x_val_pre = apply_rms(x_val_pre, window_size=10)
 
-    # 2. Scalogram
+    # --- 2. Windowing (Augmentation) ---
+    if x_train_proc is None: 
+        dummy_proc = np.zeros((len(x_train_pre), 1))
+        x_train_pre, _, y_train_pre = augment_signal(x_train_pre, dummy_proc, y_train_pre, window_size=sliding_window_size, stride=sliding_window_stride)
+        x_train_info_final = None # No info to pass
+    else:
+        x_train_pre, x_train_proc, y_train_pre = augment_signal(x_train_pre, x_train_proc, y_train_pre, window_size=sliding_window_size, stride=sliding_window_stride)
+        x_train_info_final = x_train_proc
+
+    # Val Windowing
+    if x_val_proc is None:
+        dummy_val = np.zeros((len(x_val_pre), 1))
+        x_val_pre, _, y_val_pre = augment_signal(x_val_pre, dummy_val, y_val_pre, window_size=sliding_window_size, stride=sliding_window_stride)
+        x_val_info_final = None
+    else:
+         x_val_pre, x_val_proc, y_val_pre = augment_signal(x_val_pre, x_val_proc, y_val_pre, window_size=sliding_window_size, stride=sliding_window_stride)
+         x_val_info_final = x_val_proc
+
+    # --- 3. Generative Augmentation (Post-Windowing) ---
+    gen_type = best_hp_outer.get("gen_model_type")
+         
+    if gen_type != "none":
+        logger.info(f"Augmenting data with {gen_type} for final fit...")
+        
+        # Prepare condition for generation (Info + Target)
+        if x_train_info_final is not None:
+             cond_train = np.concatenate([x_train_info_final, y_train_pre], axis=1)
+        else:
+             cond_train = y_train_pre
+             
+        # Generate same amount as original data (100% augmentation)
+        num_syn = int(x_train_pre.shape[0] * 1)
+        
+        syn_signal, syn_cond = generate_synthetic_data(gen_type, gen_config, num_syn, condition_data=cond_train, x_train_info=x_train_info_final)
+        
+        if syn_signal is not None:
+             x_train_pre = np.concatenate([x_train_pre, syn_signal], axis=0)
+             
+             # Extract y part from condition (last column)
+             syn_y = syn_cond[:, -1:]
+             y_train_pre = np.concatenate([y_train_pre, syn_y], axis=0)
+             
+             # Extract info part if multimodal
+             if x_train_info_final is not None:
+                  syn_info = syn_cond[:, :-1]
+                  x_train_info_final = np.concatenate([x_train_info_final, syn_info], axis=0)
+        else:
+             logger.warning("Generative augmentation returned None.")
+
+    # --- 4. Scalogram ---
     st = best_hp_outer.get("scalogram")
     if st == "cwt": 
         x_train_pre = convert_to_cwt(x_train_pre, description="CWT Re-gen for fit")
@@ -308,25 +324,19 @@ def main(epochs=1,
     elif st == "wsst": 
         x_train_pre = convert_to_wsst(x_train_pre, description="WSST Re-gen for fit")
         x_val_pre = convert_to_wsst(x_val_pre, description="WSST Val Re-gen for fit")
-    elif st == "stransform": 
-        x_train_pre = convert_to_stransform(x_train_pre)
-        x_val_pre = convert_to_stransform(x_val_pre)
     else: 
         x_train_pre = np.expand_dims(x_train_pre, axis=2)
         x_val_pre = np.expand_dims(x_val_pre, axis=2)
     
-    # 3. Construct Input
-    # Check if multimodal (info passed)
-    # In run_trial: if x_train_info is not None: x_train_final = [x_train_signal, x_train_info]
-    # Here input is xtr, xtr_proc. xtr_proc corresponds to info.
+    # 5. Construct Input
     if x_train_info_final is not None:
         x_train_final_fit = [x_train_pre, x_train_info_final]
     else:
         x_train_final_fit = x_train_pre
         
     # --- Prepare Validation Data for Fit ---
-    if xval_proc is not None:
-        x_val_final_fit = [x_val_pre, xval_proc]
+    if x_val_info_final is not None:
+        x_val_final_fit = [x_val_pre, x_val_info_final]
     else:
         x_val_final_fit = x_val_pre
 
@@ -357,37 +367,42 @@ def main(epochs=1,
         json.dump(best_inner_hps_dict, f, indent=4)
     
     # Preparation for Evaluation (Preprocessing)
+    # Test data also needs full pipeline: Preproc -> Window -> Scalogram
     x_test_pre = xte
     x_test_proc = xte_proc
+    y_test_pre = yte
     
-    # Apply Best Preprocessing to Test
+    # 1. Global Preproc
     if best_hp_outer.get("detrend"):
         x_test_pre = apply_detrend(x_test_pre)
     nr = best_hp_outer.get("noise_reduction")
     if nr == "moving_average":
-        #w = best_hp_outer.get("ma_window_size")
         w = ma_window_size
         x_test_pre = apply_moving_average(x_test_pre, window_size=w)
     elif nr == "high_pass":
-        #c = best_hp_outer.get("hp_cutoff")
-        x_test_pre = apply_high_pass_filter(x_test_pre)#, cutoff=c)
+        x_test_pre = apply_high_pass_filter(x_test_pre)
     elif nr == "low_pass":
-        #c = best_hp_outer.get("lp_cutoff")
-        x_test_pre = apply_low_pass_filter(x_test_pre)#, cutoff=c)
+        x_test_pre = apply_low_pass_filter(x_test_pre)
     elif nr == "rms":
         x_test_pre = apply_rms(x_test_pre, window_size=10)
     
+    # 2. Windowing
+    if x_test_proc is None:
+        dummy_test = np.zeros((len(x_test_pre), 1))
+        x_test_pre, _, y_test_pre = augment_signal(x_test_pre, dummy_test, y_test_pre, window_size=sliding_window_size, stride=sliding_window_stride)
+        x_test_info_final = None
+    else:
+        x_test_pre, x_test_proc, y_test_pre = augment_signal(x_test_pre, x_test_proc, y_test_pre, window_size=sliding_window_size, stride=sliding_window_stride)
+        x_test_info_final = x_test_proc
+
+    # 3. Scalogram
     st = best_hp_outer.get("scalogram")
     if st == "cwt": x_test_pre = convert_to_cwt(x_test_pre, description="CWT generation for test")
     elif st == "fsst": x_test_pre = convert_to_fsst(x_test_pre, description="FSST generation for test")
     elif st == "wsst": x_test_pre = convert_to_wsst(x_test_pre, description="WSST generation for test")
-    else: x_test_pre = np.expand_dims(x_test_pre, axis=2)
-
-    logger.info(f"Evaluating Best Model")
+    else: x_test_pre = np.expand_dims(x_test_pre, axis=2) 
     
-    # Save Model
-    file_name = f'{folder}/DL_AutoKeras_Best_{run_id}.keras'
-    best_model.save(file_name)
+    logger.info(f"Evaluating Best Model")
     
     # Plot Model Architecture
     try:
@@ -396,8 +411,8 @@ def main(epochs=1,
         logger.warning(f"Could not plot model: {e}")
 
     # Prepare input dynamically
-    if x_test_proc is not None:
-        x_eval = [x_test_pre, x_test_proc]
+    if x_test_info_final is not None:
+        x_eval = [x_test_pre, x_test_info_final]
     else:
         x_eval = x_test_pre
             

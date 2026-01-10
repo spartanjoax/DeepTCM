@@ -216,6 +216,7 @@ __marimo__/
 *.tf
 *.keras
 *.h5
+*.joblib
 manual*/
 
 # Images

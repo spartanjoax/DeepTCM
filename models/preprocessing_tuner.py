@@ -5,7 +5,7 @@ import torch
 import gc
 from tqdm import tqdm
 
-from helpers import apply_moving_average, apply_high_pass_filter, apply_low_pass_filter, apply_detrend, apply_rms
+from helpers import apply_moving_average, apply_high_pass_filter, apply_low_pass_filter, apply_detrend, apply_rms, augment_signal
 from helpers import convert_to_cwt, convert_to_fsst, convert_to_wsst
 from helpers import evaluate_model
 from models.generative import generate_synthetic_data
@@ -137,6 +137,8 @@ class PreprocessingTuner(kt.BayesianOptimization):
         try:
             hp = trial.hyperparameters
             ma_window_size = kwargs.pop('ma_window_size', 10)
+            sw_size = kwargs.pop('sliding_window_size', 250)
+            sw_stride = kwargs.pop('sliding_window_stride', 125)
             
             # --- 1. Define Search Space ---
             
@@ -148,10 +150,12 @@ class PreprocessingTuner(kt.BayesianOptimization):
             
             # Scalograms
             scalogram_type = hp.Choice("scalogram", ["none", "cwt", "fsst", "wsst"], default="none")
+             # Search for model type
+            gen_model_type = hp.Choice("gen_model_type", ["none", "ConditionalVAE", "TimeGAN"], default="ConditionalVAE")
             
-            # --- 1.5 Generative Data Augmentation (Pre-preprocessing) ---
+            # --- 2. Apply Preprocessing (Global) ---
             
-            # Unpack x explicitly for Generative Model (Raw Data)
+            # Unpack x (Signal, Info)
             x_train_signal = None
             x_train_info = None
             if isinstance(x, list) and len(x) == 2:
@@ -159,10 +163,66 @@ class PreprocessingTuner(kt.BayesianOptimization):
                 x_train_info = x[1]
             else:
                 x_train_signal = x
+
+            # Apply Global Preprocessing on Full Runs
+            x_train_signal = self._preprocess_set(x_train_signal, noise_reduction, None, detrend, ma_window_size=ma_window_size)
             
-            # Search for model type
-            gen_model_type = hp.Choice("gen_model_type", ["none", "ConditionalVAE", "TimeGAN"], default="ConditionalVAE")
+            # Apply to Val
+            x_val_signal = None
+            x_val_info = None
+            y_val = None
+            if validation_data is not None:
+                x_val_in = validation_data[0]
+                y_val = validation_data[1]
+                if isinstance(x_val_in, list) and len(x_val_in) == 2:
+                    x_val_signal = x_val_in[0]
+                    x_val_info = x_val_in[1]
+                else:
+                    x_val_signal = x_val_in
+                x_val_signal = self._preprocess_set(x_val_signal, noise_reduction, None, detrend, ma_window_size=ma_window_size)
+
+            # Apply to Test
+            x_test_signal = None
+            x_test_info = None
+            y_test = None
+            if 'test_data' in kwargs:
+                test_data = kwargs['test_data']
+                x_test_in = test_data[0]
+                y_test = test_data[1]
+                if isinstance(x_test_in, list) and len(x_test_in) == 2:
+                    x_test_signal = x_test_in[0]
+                    x_test_info = x_test_in[1]
+                else:
+                    x_test_signal = x_test_in
+                x_test_signal = self._preprocess_set(x_test_signal, noise_reduction, None, detrend, ma_window_size=ma_window_size)
+
+            # --- 3. Windowing (Augmentation) ---
+            # Transform (N, T, C) -> (M, W, C)            
+            if x_train_info is None:
+                 # Create dummy info to satisfy augment_signal
+                 x_train_info_aug = np.zeros((len(x_train_signal), 1))
+            else:
+                 x_train_info_aug = x_train_info
+            x_train_signal, x_train_info, y = augment_signal(x_train_signal, x_train_info_aug, y, window_size=sw_size, stride=sw_stride)
             
+            # Val
+            if x_val_signal is not None and y_val is not None:
+                if x_val_info is None: 
+                    x_val_info_aug = np.zeros((len(x_val_signal), 1))
+                else: 
+                    x_val_info_aug = x_val_info
+                x_val_signal, x_val_info, y_val = augment_signal(x_val_signal, x_val_info_aug, y_val, window_size=sw_size, stride=sw_stride)
+
+            # Test
+            if x_test_signal is not None and y_test is not None:
+                if x_test_info is None: 
+                    x_test_info_aug = np.zeros((len(x_test_signal), 1))
+                else: 
+                    x_test_info_aug = x_test_info
+                x_test_signal, x_test_info, y_test = augment_signal(x_test_signal, x_test_info_aug, y_test, window_size=sw_size, stride=sw_stride)
+
+
+            # --- 4. Generative Augmentation (Post-Windowing) ---
             gen_time = 0
             
             print(f"Memory allocated pre-gen: {torch.cuda.memory_allocated()}")
@@ -203,50 +263,17 @@ class PreprocessingTuner(kt.BayesianOptimization):
                     else:
                         print("Warning: Generative augmentation returned None or failed.")
 
-    
-
             if gen_model_type != "none":
                  gen_time = time.time() - start_gen
 
             print(f"Memory allocated post-gen: {torch.cuda.memory_allocated()}")
 
-            # --- 2. Apply Preprocessing (Noise Reduction/Scalograms) ---
-            # Use Helper for Train and Val
-            x_train_signal = self._preprocess_set(x_train_signal, noise_reduction, scalogram_type, detrend, ma_window_size=ma_window_size)
-            
-            x_val_signal = None
-            x_val_info = None
-            y_val = None
-            if validation_data is not None:
-                x_val_in = validation_data[0]
-                y_val = validation_data[1]
-                
-                # Unpack Val
-                if isinstance(x_val_in, list) and len(x_val_in) == 2:
-                    x_val_signal = x_val_in[0]
-                    x_val_info = x_val_in[1]
-                else:
-                    x_val_signal = x_val_in
-                    
-                x_val_signal = self._preprocess_set(x_val_signal, noise_reduction, scalogram_type, detrend, ma_window_size=ma_window_size)
-            
-            # Handle Test Data
-            x_test_signal = None
-            x_test_info = None
-            y_test = None
-            if 'test_data' in kwargs:
-                test_data = kwargs['test_data']
-                x_test_in = test_data[0]
-                y_test = test_data[1]
-                
-                # Unpack Test
-                if isinstance(x_test_in, list) and len(x_test_in) == 2:
-                    x_test_signal = x_test_in[0]
-                    x_test_info = x_test_in[1]
-                else:
-                    x_test_signal = x_test_in
-
-                x_test_signal = self._preprocess_set(x_test_signal, noise_reduction, scalogram_type, detrend, ma_window_size=ma_window_size)
+            # --- 5. Scalograms (Post-Windowing) ---
+            x_train_signal = self._preprocess_set(x_train_signal, "none", scalogram_type, "none", ma_window_size=ma_window_size)
+            if x_val_signal is not None:
+                x_val_signal = self._preprocess_set(x_val_signal, "none", scalogram_type, "none", ma_window_size=ma_window_size)
+            if x_test_signal is not None:
+                x_test_signal = self._preprocess_set(x_test_signal, "none", scalogram_type, "none", ma_window_size=ma_window_size)
 
             # Re-pack x_train, x_val
             if x_train_info is not None:
@@ -320,6 +347,8 @@ class PreprocessingTuner(kt.BayesianOptimization):
                 'trial_id': trial.trial_id,
                 'scalogram_type': scalogram_type,
                 'noise_reduction': noise_reduction,
+                'detrend': detrend,
+                'gen_model_type': gen_model_type,
                 'synthetic_gen_time': gen_time
             }
 
