@@ -1,0 +1,12 @@
+{
+    "_comment": "Per-signal-group CL model names. Architecture = top-1 from LOCO-CV (STFT #033 HP config, 11 folds, sw=500/ss=500/ds=2). All other HPs come from champion_timefreq_domain.json.",
+    "all":      {"model_name": "RobustCNN_LSTM_Proc"},
+    "AC":       {"model_name": "RobustCNN_LSTM_Proc"},
+    "DC":       {"model_name": "RobustCNN_LSTM_Proc"},
+    "ACDC":     {"model_name": "RobustCNN_LSTM_Proc"},
+    "AC_table": {"model_name": "RobustCNN_LSTM_Proc"},
+    "DC_table": {"model_name": "RobustCNN_LSTM_Proc"},
+    "internals":   {"model_name": "RobustCNN_LSTM_Proc"},
+    "internals_v2":{"model_name": "RobustCNN_LSTM_Proc"},
+    "internals_v3":{"model_name": "RobustCNN_LSTM_Proc"}
+}

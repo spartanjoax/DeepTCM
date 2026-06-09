@@ -1,0 +1,118 @@
+{
+  "_notes": {
+    "test_windows_eq_test_runs": "Mode B holdout is always the last sorted condition per material (CI: Vc=200/fz=0.2; SS: Vc=100/fz=0.1). Both are the shortest-duration recordings: CI ~1527-1690 raw → ~763-845 post-ds=2 → 1 window each; SS ~1558-1637 raw → ~779-818 post-ds=2 → 1 window each. Training spans all 4 conditions, many with longer recordings (SS Vc=50: ~4920 raw → ~2460 post-ds → 4-5 windows/run), hence train_windows >> train_runs while test_windows == test_runs. This is not a bug.",
+    "window_formula": "(run_length // downsample_factor - window_size) // stride + 1, with ds=2, sw=500, ss=500",
+    "nasa_windows_per_run": "5200 raw / 2 = 2600 post-ds. (2600-500)//500+1 = 5 windows/run. 86 train runs × 5 = 430 windows; 37 test runs × 5 = 185 windows."
+  },
+
+  "scenario_1": {
+    "uc": "UC1",
+    "description": "LOMO forward — cross-machine, large: NASA → all MU-SS → all MU-CI",
+    "status": "UNCHANGED",
+    "nasa_position": "first",
+    "signal_groups": ["AC", "AC_table", "DC", "DC_table"],
+    "batch_size":    [16,   8,         16,   8],
+    "experiences": [
+      {"id": 0, "source": "NASA",   "filters": null,           "n_train_runs": 86, "n_train_windows": 430, "n_test_runs": 37, "n_test_windows": 185},
+      {"id": 1, "source": "MU-TCM", "filters": {"material": 2}, "n_train_runs": 23, "n_train_windows": 62,  "n_test_runs": 7,  "n_test_windows": 7,  "_note": "7 test runs × 1 window each — Mode B holdout is SS Vc=100/fz=0.1 (short recordings)"},
+      {"id": 2, "source": "MU-TCM", "filters": {"material": 1}, "n_train_runs": 25, "n_train_windows": 25,  "n_test_runs": 8,  "n_test_windows": 8,  "_note": "8 test runs × 1 window each — Mode B holdout is CI Vc=200/fz=0.2 (short recordings)"}
+    ]
+  },
+
+  "scenario_2": {
+    "uc": "UC2",
+    "description": "Cross-machine, small: NASA + 8 individual MU-TCM conditions sequentially",
+    "status": "UNCHANGED",
+    "nasa_position": "first",
+    "signal_groups": ["AC", "AC_table", "DC", "DC_table"],
+    "batch_size":    [16,   8,         16,   8],
+    "experiences": [
+      {"id": 0, "source": "NASA",   "filters": null,                                      "n_train_runs": 86, "n_train_windows": 430, "n_test_runs": 37, "n_test_windows": 185},
+      {"id": 1, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 50},   "n_train_runs": 4,  "n_train_windows": 16,  "n_test_runs": 4,  "n_test_windows": 16},
+      {"id": 2, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 50},   "n_train_runs": 4,  "n_train_windows": 8,   "n_test_runs": 4,  "n_test_windows": 8},
+      {"id": 3, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 100},  "n_train_runs": 3,  "n_train_windows": 6,   "n_test_runs": 4,  "n_test_windows": 8},
+      {"id": 4, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 100},  "n_train_runs": 3,  "n_train_windows": 3,   "n_test_runs": 4,  "n_test_windows": 4},
+      {"id": 5, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 100},  "n_train_runs": 4,  "n_train_windows": 4,   "n_test_runs": 4,  "n_test_windows": 4},
+      {"id": 6, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 100},  "n_train_runs": 4,  "n_train_windows": 4,   "n_test_runs": 4,  "n_test_windows": 4},
+      {"id": 7, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 200},  "n_train_runs": 3,  "n_train_windows": 3,   "n_test_runs": 6,  "n_test_windows": 6},
+      {"id": 8, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 200},  "n_train_runs": 4,  "n_train_windows": 4,   "n_test_runs": 4,  "n_test_windows": 4}
+    ]
+  },
+
+  "scenario_3": {
+    "uc": "UC3",
+    "description": "LOMaterial: all CI bulk → 4 individual SS conditions. Mirror of SC4 with materials swapped.",
+    "status": "CHANGED — was SS→CI 8 individual conditions. Now bulk CI → 4 SS conditions (analogous to SC4).",
+    "nasa_position": "none",
+    "signal_groups": ["internals"],
+    "batch_size":    [16],
+    "experiences": [
+      {"id": 0, "source": "MU-TCM", "filters": {"material": 1},                           "n_train_runs": 25, "n_train_windows": 25,  "n_test_runs": 8,  "n_test_windows": 8,  "_note": "Mode B holdout: CI Vc=200/fz=0.2, 1 window/run"},
+      {"id": 1, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 50},   "n_train_runs": 4,  "n_train_windows": 16,  "n_test_runs": 4,  "n_test_windows": 16},
+      {"id": 2, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 50},   "n_train_runs": 4,  "n_train_windows": 8,   "n_test_runs": 4,  "n_test_windows": 8},
+      {"id": 3, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 100},  "n_train_runs": 3,  "n_train_windows": 6,   "n_test_runs": 4,  "n_test_windows": 8},
+      {"id": 4, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 100},  "n_train_runs": 3,  "n_train_windows": 3,   "n_test_runs": 4,  "n_test_windows": 4}
+    ]
+  },
+
+  "scenario_4": {
+    "uc": "UC4",
+    "description": "LOMaterial: all SS bulk → 4 individual CI conditions. Mirror of SC3 with materials swapped.",
+    "status": "UNCHANGED",
+    "nasa_position": "none",
+    "signal_groups": ["internals"],
+    "batch_size":    [16],
+    "experiences": [
+      {"id": 0, "source": "MU-TCM", "filters": {"material": 2},                           "n_train_runs": 23, "n_train_windows": 62,  "n_test_runs": 7,  "n_test_windows": 7,  "_note": "Mode B holdout: SS Vc=100/fz=0.1, 1 window/run"},
+      {"id": 1, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 100},  "n_train_runs": 4,  "n_train_windows": 4,   "n_test_runs": 4,  "n_test_windows": 4},
+      {"id": 2, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 100},  "n_train_runs": 4,  "n_train_windows": 4,   "n_test_runs": 4,  "n_test_windows": 4},
+      {"id": 3, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 200},  "n_train_runs": 3,  "n_train_windows": 3,   "n_test_runs": 6,  "n_test_windows": 6},
+      {"id": 4, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 200},  "n_train_runs": 4,  "n_train_windows": 4,   "n_test_runs": 4,  "n_test_windows": 4}
+    ]
+  },
+
+  "scenario_5": {
+    "uc": "UC5",
+    "description": "LOMO backward — cross-machine: MU-TCM (material order TBD) → NASA. Inversion of SC1.",
+    "status": "NEW — replaces old SC5 (CI→SS 8 individual, which is now SC6)",
+    "nasa_position": "last",
+    "signal_groups": ["AC", "AC_table", "DC", "DC_table"],
+    "batch_size":    [16,   8,         16,   8],
+    "material_order_note": "Put the material with lower cross-material BWT first, based on SC3 vs SC4 results. If SC3 (CI-first) yields lower BWT on SS experiences than SC4 (SS-first) on CI experiences, then CI goes first here.",
+    "experiences": [
+      {"id": 0, "source": "MU-TCM", "filters": {"material": "?? — TBD from SC3/SC4 results"}, "n_train_runs": "TBD: 25 (CI) or 23 (SS)", "n_train_windows": "TBD: 25 (CI) or 62 (SS)", "n_test_runs": "TBD: 8 or 7",  "n_test_windows": "TBD: 8 or 7"},
+      {"id": 1, "source": "MU-TCM", "filters": {"material": "?? — other material"},            "n_train_runs": "TBD", "n_train_windows": "TBD", "n_test_runs": "TBD", "n_test_windows": "TBD"},
+      {"id": 2, "source": "NASA",   "filters": null,                                            "n_train_runs": 86,    "n_train_windows": 430,   "n_test_runs": 37,    "n_test_windows": 185}
+    ]
+  },
+
+  "scenario_6": {
+    "uc": "UC6",
+    "description": "Single-machine, 8 individual conditions: material order TBD. Granular version of SC3/SC4 pairing.",
+    "status": "NEW — absorbs old SC3 (SS→CI) and old SC5 (CI→SS); material order determined from SC3/SC4 results",
+    "nasa_position": "none",
+    "signal_groups": ["internals"],
+    "batch_size":    [16],
+    "material_order_note": "If SC3 (bulk CI → individual SS) shows lower EAE on SS than SC4 (bulk SS → individual CI) on CI, run CI first. Otherwise SS first.",
+    "experiences_if_CI_first": [
+      {"id": 0, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 100},  "n_train_runs": 4, "n_train_windows": 4,  "n_test_runs": 4, "n_test_windows": 4},
+      {"id": 1, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 100},  "n_train_runs": 4, "n_train_windows": 4,  "n_test_runs": 4, "n_test_windows": 4},
+      {"id": 2, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 200},  "n_train_runs": 3, "n_train_windows": 3,  "n_test_runs": 6, "n_test_windows": 6},
+      {"id": 3, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 200},  "n_train_runs": 4, "n_train_windows": 4,  "n_test_runs": 4, "n_test_windows": 4},
+      {"id": 4, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 50},   "n_train_runs": 4, "n_train_windows": 16, "n_test_runs": 4, "n_test_windows": 16},
+      {"id": 5, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 50},   "n_train_runs": 4, "n_train_windows": 8,  "n_test_runs": 4, "n_test_windows": 8},
+      {"id": 6, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 100},  "n_train_runs": 3, "n_train_windows": 6,  "n_test_runs": 4, "n_test_windows": 8},
+      {"id": 7, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 100},  "n_train_runs": 3, "n_train_windows": 3,  "n_test_runs": 4, "n_test_windows": 4}
+    ],
+    "experiences_if_SS_first": [
+      {"id": 0, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 50},   "n_train_runs": 4, "n_train_windows": 16, "n_test_runs": 4, "n_test_windows": 16},
+      {"id": 1, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 50},   "n_train_runs": 4, "n_train_windows": 8,  "n_test_runs": 4, "n_test_windows": 8},
+      {"id": 2, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.05, "Vc": 100},  "n_train_runs": 3, "n_train_windows": 6,  "n_test_runs": 4, "n_test_windows": 8},
+      {"id": 3, "source": "MU-TCM", "filters": {"material": 2, "fz": 0.1,  "Vc": 100},  "n_train_runs": 3, "n_train_windows": 3,  "n_test_runs": 4, "n_test_windows": 4},
+      {"id": 4, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 100},  "n_train_runs": 4, "n_train_windows": 4,  "n_test_runs": 4, "n_test_windows": 4},
+      {"id": 5, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 100},  "n_train_runs": 4, "n_train_windows": 4,  "n_test_runs": 4, "n_test_windows": 4},
+      {"id": 6, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.1,  "Vc": 200},  "n_train_runs": 3, "n_train_windows": 3,  "n_test_runs": 6, "n_test_windows": 6},
+      {"id": 7, "source": "MU-TCM", "filters": {"material": 1, "fz": 0.2,  "Vc": 200},  "n_train_runs": 4, "n_train_windows": 4,  "n_test_runs": 4, "n_test_windows": 4}
+    ]
+  }
+}

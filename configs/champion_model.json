@@ -1,0 +1,16 @@
+{
+    "arch_type": "cnn_rnn",
+    "rnn_type": "bigru",
+    "lstm_units": 128,
+    "lstm_layers": 2,
+    "cnn_layers": 2,
+    "filters_base": 8,
+    "dropout": 0.0,
+    "weight_decay": 0.001,
+    "noise_reduction": "none",
+    "scalogram": "stft",
+    "conditioning": "film",
+    "learning_rate": 0.0005,
+    "pooling": "avg",
+    "best_epoch": 132
+}

@@ -1,0 +1,13 @@
+avalanche_lib
+joblib
+keras
+keras_tuner
+matplotlib
+numpy
+pandas
+scikit_learn
+scipy
+seaborn
+ssqueezepy
+torch
+tqdm
