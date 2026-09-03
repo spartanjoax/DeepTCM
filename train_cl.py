@@ -3,7 +3,7 @@
 # Copyrights licensed under the MIT License.                                   #
 # See the accompanying LICENSE file for terms.                                 #
 #                                                                              #
-# Date: 06-06-2026                                                             #
+# Date: 09-03-2026                                                             #
 # Author(s): José Joaquín Peralta Abadía                                       #
 # E-mail: josejoaquin.peralta.abadia@gmail.com                                 #
 ################################################################################
@@ -76,6 +76,7 @@ _REPLAY_SC346 = [0, 50, 100]
 STRATEGIES = {
     "cumulative": {"replay_mem": [0]},
     "naive": {},
+    "swa": {"replay_mem": [0]},
     "ewc": [
         {
             "lambda": [0.1, 1, 10, 100],
@@ -265,7 +266,9 @@ def _apply_scenario_overrides(strat_key, base_grid, scenario_config):
     def _patch(d):
         """Apply scenario-specific override to a single strategy config dict."""
         out = dict(d)
-        if (strat_key not in ("cumulative")
+        # Only override replay_mem for strategies that search over it.
+        # Cumulative and SWA have fixed replay_mem=[0]; do not expand.
+        if (strat_key not in ("cumulative", "swa")
                 and "replay_mem" in out and sc_replay is not None):
             out["replay_mem"] = sc_replay
         if strat_key == "agem" and "patterns_per_exp" in out and sc_ppe is not None:
@@ -308,6 +311,50 @@ def extract_experience_rmse(eval_result):
             exp_id = int(m.group(1))
             rmses[exp_id] = float(val[0]) if isinstance(val, tuple) else float(val)
     return rmses
+
+
+def compute_fwt(strat_results, n_experiences, b_bar=None):
+    """Compute Forward Transfer following Lopez et al. (2017) Eq. (4).
+
+    Lopez's definition (adapted for RMSE, lower = better):
+
+        FWT = (1/(T-1)) * Σ_{k=1}^{T-1} ( b̄_k - R_{k-1, k} )
+
+    where:
+        b̄_k      = RMSE on experience k at RANDOM INITIALISATION
+                    (before any training; stored from the pre-loop baseline eval)
+        R_{k-1,k} = RMSE on experience k after training on experiences 0..k-1
+                    but BEFORE training on experience k  (zero-shot)
+
+    Sign convention for RMSE (matches Lopez's accuracy convention):
+        Positive FWT → zero-shot RMSE below random-init baseline (good transfer)
+        Negative FWT → zero-shot RMSE above random-init baseline (interference)
+
+    Returns:
+    	single float scalar (or 0.0 if T < 2).
+    """
+    if n_experiences < 2 or len(strat_results) < 2:
+        return 0.0
+
+    rmse_per_step = [
+        extract_experience_rmse(sr, n_experiences) for sr in strat_results
+    ]
+
+    vals = []
+    for k in range(1, n_experiences):          # k = 1 .. T-1
+        r_prev_k = rmse_per_step[k - 1].get(k)  # R_{k-1, k}: zero-shot RMSE
+        if r_prev_k is None:
+            continue
+        if b_bar is not None and k < len(b_bar) and b_bar[k] is not None:
+            # Lopez exact: b̄_k - R_{k-1,k}
+            vals.append(b_bar[k] - r_prev_k)
+        else:
+            # Fallback (no baseline stored): b̄_k ≈ R_{k,k}
+            r_kk = rmse_per_step[k].get(k)
+            if r_kk is not None:
+                vals.append(r_kk - r_prev_k)
+
+    return float(np.mean(vals)) if vals else 0.0
 
 
 def compute_max_forgetting(strat_results, n_experiences):
@@ -828,6 +875,8 @@ def main(args):
 
                     strat_results = []
                     b_bar = None
+                    _swa_state = None
+                    _swa_n = 0
                     elapsed_offset = 0.0
                     _fisher_diag = {}
                     _agem_eff_ppe = []
@@ -837,6 +886,8 @@ def main(args):
                                           weights_only=False)
                         strat_results = meta["strat_results"]
                         b_bar = meta["b_bar"]
+                        _swa_state = meta.get("swa_state")
+                        _swa_n = meta.get("swa_n", 0)
                         elapsed_offset = meta.get("elapsed", 0.0)
                         _fisher_diag = meta.get("fisher_diag", {})
                         _agem_eff_ppe = meta.get("agem_eff_ppe", [])
@@ -908,15 +959,44 @@ def main(args):
                                 f"(nominal={_nom}, exp_size={_actual})"
                             )
 
-                        strat_results.append(
-                            strategy.eval(benchmark.test_stream)
-                        )
+                        if strat_key == "swa":
+                            # Accumulate uniform average
+                            _swa_n += 1
+                            cur_sd = {
+                                k: v.detach().clone()
+                                for k, v in model.state_dict().items()
+                            }
+                            _swa_state = (
+                                cur_sd
+                                if _swa_state is None
+                                else {
+                                    k: (_swa_state[k] * (_swa_n - 1) + cur_sd[k])
+                                    / _swa_n
+                                    for k in cur_sd
+                                }
+                            )
+                            # Eval with averaged weights; restore for next exp
+                            orig_sd = {
+                                k: v.detach().clone()
+                                for k, v in model.state_dict().items()
+                            }
+                            model.load_state_dict(_swa_state)
+                            strat_results.append(
+                                strategy.eval(benchmark.test_stream)
+                            )
+                            model.load_state_dict(orig_sd)
+                        else:
+                            strat_results.append(
+                                strategy.eval(benchmark.test_stream)
+                            )
 
                         save_checkpoint(strategy, av_ckpt)
                         torch.save(
                             {
                                 "strat_results": strat_results,
                                 "b_bar": b_bar,
+                                "swa_state": _swa_state,
+                                "swa_n": _swa_n,
                                 "elapsed": elapsed_offset + (time.time() - start),
                                 "fisher_diag": _fisher_diag,
                                 "agem_eff_ppe": _agem_eff_ppe,
@@ -927,6 +1007,9 @@ def main(args):
                     elapsed = elapsed_offset + (time.time() - start)
                     logger.info(f"    Total time: {elapsed:.1f}s")
 
+                    if strat_key == "swa" and _swa_state is not None:
+                        model.load_state_dict(_swa_state)
+                        
                     ckpt_path = os.path.join(
                         scenario_dir,
                         "checkpoints",
@@ -1036,9 +1119,11 @@ def _create_strategy(strat_key, params, common_kw, logger):
         logger.info("    Cumulative training (oracle upper bound)")
         return Cumulative(**common_kw, reset_weights=True)
 
-    if strat_key in ("naive"):
+    if strat_key in ("naive", "swa"):
         logger.info(
-            "    Naive fine-tuning (forgetting baseline)"
+            "    Naive fine-tuning"
+            + (" + SWA weight averaging (applied post-experience)"
+               if strat_key == "swa" else " (forgetting baseline)")
         )
         return Naive(**common_kw)
     
