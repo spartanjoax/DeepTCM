@@ -5,11 +5,7 @@
 ![Keras 3](https://img.shields.io/badge/Keras-3.x-red)
 ![Avalanche 0.6](https://img.shields.io/badge/Avalanche-0.6-green)
 
-This repository contains the complete training code presented in the PhD thesis:
-
-> Peralta Abadía, J.J. *Enhancing Smart Monitoring in Face Milling with Deep Continual Learning*. Mondragon Unibertsitatea, 2026.
-
-It covers three complementary contributions: (1) expert-defined deep learning models, (2) joint AutoML hyperparameter search, and (3) a continual learning framework for cross-machine and cross-material tool wear adaptation.
+This repository covers three complementary contributions: (1) expert-defined deep learning models, (2) joint AutoML hyperparameter search, and (3) a continual learning evaluation for cross-machine and cross-material tool wear adaptation.
 
 ---
 
